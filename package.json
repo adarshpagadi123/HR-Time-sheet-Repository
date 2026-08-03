@@ -1,0 +1,10 @@
+{
+  "devDependencies": {
+    "@playwright/mcp": "^0.0.78",
+    "@playwright/test": "latest",
+    "@types/node": "^26.1.2"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
+}
