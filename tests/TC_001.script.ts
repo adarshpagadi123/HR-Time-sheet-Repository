@@ -168,7 +168,6 @@ async function getActivePage(
   context: import('@playwright/test').BrowserContext,
   fallback: Page
 ): Promise<Page> {
-  await fallback.waitForTimeout(3000).catch(() => {});
   const pages = context.pages();
   for (const p of pages) {
     try {
@@ -302,8 +301,20 @@ function parseTimeSheetsFromText(rawText: string): string[][] {
  * navigate to Time & Expense, apply the date filter, and return extracted rows.
  * Returns [] if no timesheets found for this WO.
  */
-async function fetchTimesheetsForWO(ap: Page, woid: string): Promise<string[][]> {
+async function fetchTimesheetsForWO(
+  ap: Page,
+  woid: string,
+  context: import('@playwright/test').BrowserContext
+): Promise<{ rows: string[][]; page: Page }> {
   console.log(`\n--- Fetching: ${woid} ---`);
+
+  // Re-resolve the active page — SAP may have opened a new tab during the previous WO
+  try {
+    const url = ap.url();
+    if (!url || url === 'about:blank') ap = await getActivePage(context, ap);
+  } catch {
+    ap = await getActivePage(context, ap);
+  }
 
   // Search
   const searchField = ap.locator(
@@ -324,7 +335,7 @@ async function fetchTimesheetsForWO(ap: Page, woid: string): Promise<string[][]>
       await waitForSettle(ap, 3000);
     } catch {
       console.log(`  Could not find "Go to Details" for ${woid} — skipping`);
-      return [];
+      return { rows: [], page: ap };
     }
   }
 
@@ -334,7 +345,7 @@ async function fetchTimesheetsForWO(ap: Page, woid: string): Promise<string[][]>
     await teTab.waitFor({ state: 'visible', timeout: 15000 });
   } catch {
     console.log(`  No Time & Expense tab found for ${woid} — skipping`);
-    return [];
+    return { rows: [], page: ap };
   }
   await teTab.click();
   await waitForSettle(ap, 3000);
@@ -345,7 +356,7 @@ async function fetchTimesheetsForWO(ap: Page, woid: string): Promise<string[][]>
     await dateInputs.first().waitFor({ state: 'visible', timeout: 12000 });
   } catch {
     console.log(`  No date inputs found for ${woid} — skipping`);
-    return [];
+    return { rows: [], page: ap };
   }
 
   await dateInputs.nth(0).click({ clickCount: 3 });
@@ -367,7 +378,7 @@ async function fetchTimesheetsForWO(ap: Page, woid: string): Promise<string[][]>
   const rawText = await ap.evaluate(() => document.body.innerText);
   const rows = parseTimeSheetsFromText(rawText);
   console.log(`  Found ${rows.length} timesheet rows`);
-  return rows;
+  return { rows, page: ap };
 }
 
 // ─── Main test ────────────────────────────────────────────────────────────────
@@ -376,8 +387,8 @@ test('Hr Time Sheet Format — All WOs', async ({ page, context }) => {
 
   // ── Read WOIDs from WO sheet ─────────────────────────────────────────────────
   // To run for ALL WOIDs: remove the .slice(0, 1) below
-  const woList = (await readWOSheet()).slice(0, 5);
-  // const woList = await readWOSheet(); // ← uncomment this (and comment line above) to run all
+  // const woList = (await readWOSheet()).slice(0, 5);
+  const woList = await readWOSheet(); // ← uncomment this (and comment line above) to run all
   expect(woList.length).toBeGreaterThan(0);
   console.log(`Processing ${woList.length} WOID(s):`, woList.map(w => w.woid).join(', '));
 
@@ -443,9 +454,13 @@ test('Hr Time Sheet Format — All WOs', async ({ page, context }) => {
   for (const { woid, name } of woList) {
     let rows: string[][] = [];
     try {
-      rows = await fetchTimesheetsForWO(ap, woid);
+      const result = await fetchTimesheetsForWO(ap, woid, context);
+      rows = result.rows;
+      ap = result.page; // keep ap up-to-date in case SAP switched tabs
     } catch (err) {
       console.log(`  ERROR fetching ${woid}: ${err}`);
+      // Try to recover the active page before continuing to the next WO
+      try { ap = await getActivePage(context, ap); } catch { /* ignore */ }
     }
 
     if (rows.length === 0) {
