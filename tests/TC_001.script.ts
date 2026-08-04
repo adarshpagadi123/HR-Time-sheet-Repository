@@ -319,7 +319,7 @@ test('Hr Time Sheet Format — All WOs', async ({ page, context }) => {
 
   // ── Read WOIDs from WO sheet ─────────────────────────────────────────────────
   // To run for ALL WOIDs: remove the .slice(0, 1) below
-  const woList = (await readWOSheet()).slice(0, 1);
+  const woList = (await readWOSheet()).slice(0, 5);
   // const woList = await readWOSheet(); // ← uncomment this (and comment line above) to run all
   expect(woList.length).toBeGreaterThan(0);
   console.log(`Processing ${woList.length} WOID(s):`, woList.map(w => w.woid).join(', '));
