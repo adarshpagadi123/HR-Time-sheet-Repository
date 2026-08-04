@@ -42,79 +42,84 @@ async function readWOSheet(): Promise<Array<{ woid: string; name: string }>> {
   return items;
 }
 
-/** Write all collected rows to the output sheet (clears it first) */
-async function writeOutputSheet(allRows: string[][]) {
+/**
+ * Initialize the output sheet once at the start — write header row only.
+ * Called once before the WO loop begins.
+ */
+async function initOutputSheet() {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(XLSX_PATH);
 
   let ws = wb.getWorksheet(SHEET_NAME);
   if (!ws) {
     ws = wb.addWorksheet(SHEET_NAME);
-    console.log(`Created sheet "${SHEET_NAME}"`);
   } else {
     ws.spliceRows(1, ws.rowCount);
-    console.log(`Cleared sheet "${SHEET_NAME}"`);
   }
 
-  // Header row — blue background, white bold text
-  const headerRow = ws.addRow(OUTPUT_HEADERS);
-  headerRow.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0070C0' } };
-  headerRow.font   = { bold: true, color: { argb: 'FFFFFFFF' } };
-  headerRow.alignment = { horizontal: 'center', vertical: 'middle' };
-
-  // Data rows
-  for (const row of allRows) {
-    ws.addRow(row);
-  }
-
-  // Auto-fit column widths
-  ws.columns.forEach(col => {
-    let maxLen = 10;
-    col.eachCell?.({ includeEmpty: false }, cell => {
-      const v = cell.value?.toString() ?? '';
-      if (v.length > maxLen) maxLen = v.length;
-    });
-    col.width = maxLen + 2;
-  });
+  // Header row — no color
+  ws.addRow(OUTPUT_HEADERS);
 
   await wb.xlsx.writeFile(XLSX_PATH);
-  console.log(`\nSaved ${allRows.length} data rows to "${SHEET_NAME}" in FieldGlass.xlsx`);
+  console.log(`Initialized sheet "${SHEET_NAME}" with headers`);
 }
 
 /**
- * Write raw timesheet rows to the "fields" sheet.
- * The sheet already has the header row: Status | ID | Start | End | Approved | ST | OT | DT | Others | NB | Amount (INR)
- * We keep the header and replace all data rows below it.
- * Each input row = [Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount]
+ * Append rows for one WOID to the output sheet.
+ * Reads the file, appends rows, saves — called after each WOID fetch.
  */
-async function writeFieldsSheet(rows: string[][]) {
+async function appendToOutputSheet(newRows: string[][]) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(XLSX_PATH);
+
+  const ws = wb.getWorksheet(SHEET_NAME);
+  if (!ws) throw new Error(`Sheet "${SHEET_NAME}" not found`);
+
+  for (const row of newRows) {
+    ws.addRow(row);
+  }
+
+  await wb.xlsx.writeFile(XLSX_PATH);
+}
+
+/**
+ * Initialize the fields sheet once — keep existing header row, clear all data rows.
+ * Called once before the WO loop begins.
+ */
+async function initFieldsSheet() {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(XLSX_PATH);
 
   const ws = wb.getWorksheet('fields');
   if (!ws) throw new Error('"fields" sheet not found in FieldGlass.xlsx');
 
-  // Keep row 1 (header), delete everything after it
+  // Keep row 1 (header), clear data rows
   const totalRows = ws.rowCount;
   if (totalRows > 1) ws.spliceRows(2, totalRows - 1);
 
-  // Append data rows
+  await wb.xlsx.writeFile(XLSX_PATH);
+  console.log('Initialized "fields" sheet (header kept, data cleared)');
+}
+
+/**
+ * Append rows for one WOID to the fields sheet.
+ * Called after each WOID fetch.
+ * Each input row = [Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount]
+ */
+async function appendToFieldsSheet(rows: string[][]) {
+  if (rows.length === 0) return;
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(XLSX_PATH);
+
+  const ws = wb.getWorksheet('fields');
+  if (!ws) throw new Error('"fields" sheet not found in FieldGlass.xlsx');
+
   for (const row of rows) {
     ws.addRow(row);
   }
 
-  // Auto-fit column widths
-  ws.columns.forEach(col => {
-    let maxLen = 10;
-    col.eachCell?.({ includeEmpty: false }, cell => {
-      const v = cell.value?.toString() ?? '';
-      if (v.length > maxLen) maxLen = v.length;
-    });
-    col.width = maxLen + 2;
-  });
-
   await wb.xlsx.writeFile(XLSX_PATH);
-  console.log(`\nSaved ${rows.length} rows to "fields" sheet in FieldGlass.xlsx`);
 }
 
 // ─── Page helpers ─────────────────────────────────────────────────────────────
@@ -375,8 +380,12 @@ test('Hr Time Sheet Format — All WOs', async ({ page, context }) => {
   console.log('Login OK:', ap.url());
   await dismissPanel(ap);
 
-  // ── Loop through all WOs ─────────────────────────────────────────────────────
-  const allOutputRows: string[][] = [];
+  // ── Initialize both sheets once (header only) ───────────────────────────────
+  await initOutputSheet();
+  await initFieldsSheet();
+
+  // ── Loop: fetch each WOID then immediately write to Excel ────────────────────
+  let totalWritten = 0;
 
   for (const { woid, name } of woList) {
     let rows: string[][] = [];
@@ -386,44 +395,36 @@ test('Hr Time Sheet Format — All WOs', async ({ page, context }) => {
       console.log(`  ERROR fetching ${woid}: ${err}`);
     }
 
+    // Build output rows for 01-Jul-2026_31-Jul-2026 sheet
+    const outputRows: string[][] = [];
     if (rows.length === 0) {
-      // Record a single "no data" row so we know it was checked
-      allOutputRows.push([woid, name, '', 'No Data', '', '', '', '', '', '', '', '', '']);
+      outputRows.push([woid, name, '', 'No Data', '', '', '', '', '', '', '', '', '']);
     } else {
-      // Prepend WOID and Worker Name to each timesheet row
-      // Raw row = [Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount]
       for (const row of rows) {
         const [status, tsId, start, end, approved, st, ot, dt, others, nb, amount] = row;
-        allOutputRows.push([
-          woid, name, tsId, status,
-          start, end, approved,
-          st, ot, dt, others, nb, amount,
-        ]);
+        outputRows.push([woid, name, tsId, status, start, end, approved, st, ot, dt, others, nb, amount]);
       }
     }
 
-    console.log(`  Written ${rows.length} rows for ${woid}`);
-  }
+    // Build fields rows (skip no-data rows)
+    const fieldsRows: string[][] = rows.map(row => {
+      const [status, tsId, start, end, approved, st, ot, dt, others, nb, amount] = row;
+      return [status, tsId, start, end, approved, st, ot, dt, others, nb, amount];
+    });
 
-  // ── Write all results to Excel ────────────────────────────────────────────────
-  // Build raw rows for the fields sheet: Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount
-  // (skip WOs that had no data)
-  const fieldsRows: string[][] = [];
-  for (const outputRow of allOutputRows) {
-    // outputRow = [WOID, Name, TimesheetID, Status, Start, End, Approved, ST, OT, DT, Others, NB, Amount]
-    if (outputRow[3] === 'No Data') continue; // skip no-data placeholder rows
-    const [, , tsId, status, start, end, approved, st, ot, dt, others, nb, amount] = outputRow;
-    fieldsRows.push([status, tsId, start, end, approved, st, ot, dt, others, nb, amount]);
-  }
+    // Write immediately after fetch — data is safe even if test times out later
+    await appendToOutputSheet(outputRows);
+    await appendToFieldsSheet(fieldsRows);
 
-  await writeOutputSheet(allOutputRows);
-  await writeFieldsSheet(fieldsRows);
+    totalWritten += outputRows.length;
+    console.log(`  Saved ${rows.length} row(s) for ${woid} to Excel`);
+  }
 
   console.log('\n=== COMPLETE ===');
   console.log(`Total WOs processed : ${woList.length}`);
-  console.log(`Total rows written  : ${allOutputRows.length}`);
+  console.log(`Total rows written  : ${totalWritten}`);
   console.log(`Output file         : ${XLSX_PATH}`);
   console.log(`Output sheet        : ${SHEET_NAME}`);
 
-  expect(allOutputRows.length).toBeGreaterThan(0);
+  expect(totalWritten).toBeGreaterThan(0);
 });
