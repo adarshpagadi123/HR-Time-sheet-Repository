@@ -193,9 +193,9 @@ async function getActivePage(
  */
 function parseTimeSheetsFromText(rawText: string): string[][] {
   const STATUS_WORDS = ['Invoiced', 'Draft', 'Pending', 'Rejected', 'Submitted', 'Recalled'];
-  const COL_COUNT = 11; // Status + 10 more
+  const COL_COUNT = 11; // Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount
 
-  // Step 1: merge "DD/MM/YYYY" + "HH:MM AM/PM" pairs that the page splits across 2 lines
+  // Step 1: merge "DD/MM/YYYY" + "HH:MM AM/PM" pairs split across 2 lines
   const rawLines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   const lines: string[] = [];
   for (let i = 0; i < rawLines.length; i++) {
@@ -209,11 +209,11 @@ function parseTimeSheetsFromText(rawText: string): string[][] {
     }
   }
 
-  // Step 2: find "Time Sheets" section
+  // Step 2: find "Time Sheets" section heading
   const tsIdx = lines.findIndex(l => l === 'Time Sheets');
   if (tsIdx === -1) return [];
 
-  // Step 3: find the "Status" column header right after the section heading
+  // Step 3: find "Status" column header after the heading
   let headerIdx = -1;
   for (let i = tsIdx; i < Math.min(tsIdx + 25, lines.length); i++) {
     if (lines[i] === 'Status') { headerIdx = i; break; }
@@ -224,22 +224,69 @@ function parseTimeSheetsFromText(rawText: string): string[][] {
   let dataStart = headerIdx + COL_COUNT;
   if (lines[dataStart] === 'All') dataStart++;
 
+  // Helper: true if a line is a section boundary / sort indicator
+  const isBoundary = (l: string) =>
+    l.startsWith('Clear Sort') || l.startsWith('Clear Filters') ||
+    l.startsWith('No items') || l.startsWith('Press enter') ||
+    /^\d+-\d+ of \d+/.test(l) ||
+    l === 'Absences' || l === 'Expense Sheets' || l === 'Credit/Debit Memo';
+
+  // Helper: true if a line looks like a timesheet ID (LHTLTS...)
+  const isTimesheetId = (l: string) => /^[A-Z]{3,}TS\d+$/.test(l);
+
+  // Helper: true if a line looks like a date (DD/MM/YYYY or DD/MM/YYYY HH:MM AM/PM)
+  const isDate = (l: string) => /^\d{2}\/\d{2}\/\d{4}/.test(l);
+
+  // Helper: true if a line is a plain number (ST/OT/DT/Others/NB hours or amount)
+  const isNumber = (l: string) => /^-?[\d,]+(\.\d+)?$/.test(l);
+
   // Step 5: collect rows — each starts with a status word
+  // For Pending/Draft rows the Approved field may be empty, so we detect row
+  // boundaries by looking for the NEXT status word or boundary, not fixed column count.
   const rows: string[][] = [];
   let i = dataStart;
+
   while (i < lines.length) {
     const line = lines[i];
-    if (
-      line.startsWith('Clear Sort') || line.startsWith('No items') ||
-      line.startsWith('Press enter') || /^\d+-\d+ of \d+/.test(line) ||
-      line === 'Absences' || line === 'Expense Sheets' || line === 'Credit/Debit Memo'
-    ) break;
+
+    if (isBoundary(line)) break;
 
     if (STATUS_WORDS.includes(line)) {
-      const row: string[] = [line];
-      for (let j = 1; j < COL_COUNT; j++) row.push(lines[i + j] ?? '');
+      // We know the row structure: Status | ID | Start | End | Approved | ST | OT | DT | Others | NB | Amount
+      // Approved is a datetime for Invoiced, but empty for Pending/Draft (not yet approved)
+      // Collect up to COL_COUNT cells, stopping early if we hit the next status word or boundary
+      const row: string[] = [line]; // [0] Status
+      let j = i + 1;
+
+      // [1] Timesheet ID
+      if (j < lines.length && !STATUS_WORDS.includes(lines[j]) && !isBoundary(lines[j]))
+        row.push(lines[j++]);
+      else row.push('');
+
+      // [2] Start date
+      if (j < lines.length && isDate(lines[j]))
+        row.push(lines[j++]);
+      else row.push('');
+
+      // [3] End date
+      if (j < lines.length && isDate(lines[j]))
+        row.push(lines[j++]);
+      else row.push('');
+
+      // [4] Approved date — only present if row is Invoiced/has approval datetime
+      if (j < lines.length && isDate(lines[j]))
+        row.push(lines[j++]);
+      else row.push(''); // Pending/Draft: no approval date
+
+      // [5-10] ST, OT, DT, Others, NB, Amount — numeric fields
+      for (let k = 5; k < COL_COUNT; k++) {
+        if (j < lines.length && isNumber(lines[j]) && !STATUS_WORDS.includes(lines[j]) && !isBoundary(lines[j]))
+          row.push(lines[j++]);
+        else row.push('');
+      }
+
       rows.push(row);
-      i += COL_COUNT;
+      i = j; // advance past consumed cells
     } else {
       i++;
     }
@@ -265,6 +312,20 @@ async function fetchTimesheetsForWO(ap: Page, woid: string): Promise<string[][]>
   await searchField.fill(woid);
   await searchField.press('Enter');
   await waitForSettle(ap, 3000);
+
+  // If search landed on Global Search page (global_search.do), click "Go to Details"
+  if (ap.url().includes('global_search.do')) {
+    console.log(`  Global Search page detected — clicking "Go to Details"`);
+    const goToDetails = ap.locator('a:has-text("Go to Details"), a[href*="work_order_detail"]').first();
+    try {
+      await goToDetails.waitFor({ state: 'visible', timeout: 10000 });
+      await goToDetails.click();
+      await waitForSettle(ap, 3000);
+    } catch {
+      console.log(`  Could not find "Go to Details" for ${woid} — skipping`);
+      return [];
+    }
+  }
 
   // Click Time & Expense tab
   const teTab = ap.locator('a[href*="tabId=timeAndExpense"], a:has-text("Time & Expense")').first();
