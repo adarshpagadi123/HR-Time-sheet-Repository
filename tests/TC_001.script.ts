@@ -192,7 +192,8 @@ async function getActivePage(
  * Returns raw data rows (11 cells each: Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount).
  */
 function parseTimeSheetsFromText(rawText: string): string[][] {
-  const STATUS_WORDS = ['Invoiced', 'Draft', 'Pending', 'Rejected', 'Submitted', 'Recalled'];
+  const STATUS_PREFIXES = ['Invoiced', 'Draft', 'Pending', 'Rejected', 'Submitted', 'Recalled'];
+  const isStatus = (l: string) => STATUS_PREFIXES.some(p => l === p || l.startsWith(p + ' '));
   const COL_COUNT = 11; // Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount
 
   // Step 1: merge "DD/MM/YYYY" + "HH:MM AM/PM" pairs split across 2 lines
@@ -251,7 +252,7 @@ function parseTimeSheetsFromText(rawText: string): string[][] {
 
     if (isBoundary(line)) break;
 
-    if (STATUS_WORDS.includes(line)) {
+    if (isStatus(line)) {
       // We know the row structure: Status | ID | Start | End | Approved | ST | OT | DT | Others | NB | Amount
       // Approved is a datetime for Invoiced, but empty for Pending/Draft (not yet approved)
       // Collect up to COL_COUNT cells, stopping early if we hit the next status word or boundary
@@ -259,7 +260,7 @@ function parseTimeSheetsFromText(rawText: string): string[][] {
       let j = i + 1;
 
       // [1] Timesheet ID
-      if (j < lines.length && !STATUS_WORDS.includes(lines[j]) && !isBoundary(lines[j]))
+      if (j < lines.length && !isStatus(lines[j]) && !isBoundary(lines[j]))
         row.push(lines[j++]);
       else row.push('');
 
@@ -280,7 +281,7 @@ function parseTimeSheetsFromText(rawText: string): string[][] {
 
       // [5-10] ST, OT, DT, Others, NB, Amount — numeric fields
       for (let k = 5; k < COL_COUNT; k++) {
-        if (j < lines.length && isNumber(lines[j]) && !STATUS_WORDS.includes(lines[j]) && !isBoundary(lines[j]))
+        if (j < lines.length && isNumber(lines[j]) && !isStatus(lines[j]) && !isBoundary(lines[j]))
           row.push(lines[j++]);
         else row.push('');
       }
@@ -375,8 +376,8 @@ test('Hr Time Sheet Format — All WOs', async ({ page, context }) => {
 
   // ── Read WOIDs from WO sheet ─────────────────────────────────────────────────
   // To run for ALL WOIDs: remove the .slice(0, 1) below
-  // const woList = (await readWOSheet()).slice(0, 5);
-  const woList = await readWOSheet(); // ← uncomment this (and comment line above) to run all
+  const woList = (await readWOSheet()).slice(0, 5);
+  // const woList = await readWOSheet(); // ← uncomment this (and comment line above) to run all
   expect(woList.length).toBeGreaterThan(0);
   console.log(`Processing ${woList.length} WOID(s):`, woList.map(w => w.woid).join(', '));
 
