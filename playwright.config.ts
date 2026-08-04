@@ -7,5 +7,5 @@ export default defineConfig({
     baseURL: 'https://www.us.fieldglass.cloud.sap',
     headless: false,
   },
-  timeout: 120000,
+  timeout: 0,
 });
