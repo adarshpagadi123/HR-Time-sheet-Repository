@@ -9,10 +9,15 @@ import type { WalnutContext, WalnutWebContext } from './walnut';
  * category: Data Processing
  */
 export async function searchAndExportToExcel(ctx: WalnutContext) {
-  // String is built at runtime so esbuild cannot constant-fold it into a
-  // traceable literal — esbuild only resolves import('literal'), never import(expr).
+  // createRequire with absolute cache path — forces Node to resolve 'exceljs'
+  // from the cache node_modules, not from app.asar (the Walnut Agent bundle).
+  // 'module' is a Node built-in so esbuild does NOT bundle it.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { createRequire } = await import('module');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const xl: any = await import(['excel', 'js'].join(''));
+  const xl: any = createRequire(
+    '/Users/santhosh.m01/Library/Application Support/WalnutAgent/custom-methods-cache/6a70658b1c9c6637181143a4/HR-Time-sheet-Repository/walnut-methods/package.json'
+  )('exceljs');
 
   // Cast to WalnutWebContext for browser access (ctx.page, click, type, etc.)
   const webCtx = ctx as WalnutWebContext;
