@@ -1,4 +1,4 @@
-import type { WalnutWebContext } from './walnut';
+import type { WalnutContext } from './walnut';
 import type { Page } from '@playwright/test';
 import * as ExcelJS from 'exceljs';
 
@@ -6,11 +6,11 @@ import * as ExcelJS from 'exceljs';
  * name: Search IDs from Excel and Write Results to Output Sheet
  * description: Open workbook ${filePath} sheet ${inputSheetName} column ${idColumnName} search each ID on web UI with from date ${fromDate} and to date ${toDate} and write results into sheet ${outputSheetName}
  * actionType: custom_search_and_export_to_excel
- * context: web
+ * context: shared
  * needsLocator: false
  * category: Data Processing
  */
-export async function searchAndExportToExcel(ctx: WalnutWebContext) {
+export async function searchAndExportToExcel(ctx: WalnutContext) {
   const filePath        = ctx.args[0];
   const inputSheetName  = ctx.args[1];
   const idColumnName    = ctx.args[2];
