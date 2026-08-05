@@ -1,5 +1,4 @@
 import type { WalnutContext } from './walnut';
-import type { Page } from 'playwright';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const ExcelJS: typeof import('exceljs') = require('exceljs');
 
@@ -7,11 +6,11 @@ const ExcelJS: typeof import('exceljs') = require('exceljs');
  * name: Search IDs from Excel and Write Results to Output Sheet
  * description: Open workbook ${filePath} sheet ${inputSheetName} column ${idColumnName} search each ID on web UI with from date ${fromDate} and to date ${toDate} and write results into sheet ${outputSheetName}
  * actionType: custom_search_and_export_to_excel
- * context: shared
+ * context: web
  * needsLocator: false
  * category: Data Processing
  */
-export async function searchAndExportToExcel(ctx: WalnutContext) {
+export async function searchAndExportToExcel(ctx: WalnutContext & { page: import('playwright').Page }) {
   const filePath        = ctx.args[0];
   const inputSheetName  = ctx.args[1];
   const idColumnName    = ctx.args[2];
