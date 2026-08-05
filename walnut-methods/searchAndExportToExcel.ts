@@ -1,6 +1,5 @@
 import type { WalnutContext } from './walnut';
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const ExcelJS: typeof import('exceljs') = require('exceljs');
+import type * as ExcelJS from 'exceljs'; // type-only: erased before esbuild, never bundled
 
 /** @walnut_method
  * name: Search IDs from Excel and Write Results to Output Sheet
@@ -10,7 +9,15 @@ const ExcelJS: typeof import('exceljs') = require('exceljs');
  * needsLocator: false
  * category: Data Processing
  */
-export async function searchAndExportToExcel(ctx: WalnutContext & { page: import('playwright').Page }) {
+export async function searchAndExportToExcel(ctx: WalnutContext) {
+  // eval('require') is the only pattern esbuild cannot statically trace —
+  // it bypasses the bundler's dependency resolution entirely so exceljs is
+  // loaded at runtime (after the agent has installed it) rather than at build time.
+  // eslint-disable-next-line no-eval
+  const ExcelJS: typeof import('exceljs') = eval('require')('exceljs');
+
+  const webCtx = ctx as import('./walnut').WalnutWebContext;
+
   const filePath        = ctx.args[0];
   const inputSheetName  = ctx.args[1];
   const idColumnName    = ctx.args[2];
@@ -90,10 +97,9 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
   }
 
   // ── Poll browser JS until a real Timesheet ID appears in the grid ────────────
-  // Returns false if no results appear within timeoutMs (no-results ID).
-  async function waitForGridReady(page: Page, timeoutMs = 90000): Promise<boolean> {
+  async function waitForGridReady(timeoutMs = 90000): Promise<boolean> {
     try {
-      await page.waitForFunction(
+      await webCtx.page.waitForFunction(
         ({ rowSel }: { rowSel: string }) => {
           const rows = document.querySelectorAll(rowSel);
           for (const row of Array.from(rows)) {
@@ -113,16 +119,11 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
   }
 
   // ── Read all result rows in one page.evaluate() call ────────────────────────
-  // Reads cell values from the `title` attribute (stamped by jqx at row-attach
-  // time). Falls back to child textContent if title is empty.
-  async function scrapeResultRows(
-    page: Page,
-    sourceId: string,
-  ): Promise<Record<string, string>[]> {
+  async function scrapeResultRows(sourceId: string): Promise<Record<string, string>[]> {
     type ColDef = { index: number; header: string; child: string };
     const cols: ColDef[] = LOCATORS.columns.map((c) => ({ ...c }));
 
-    const rawRows = await page.evaluate(
+    const rawRows = await webCtx.page.evaluate(
       ({ rowSel, columns }: { rowSel: string; columns: ColDef[] }) => {
         const rowEls = document.querySelectorAll(rowSel);
         const results: Record<string, string>[] = [];
@@ -145,7 +146,6 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
       { rowSel: LOCATORS.resultRow, columns: cols },
     );
 
-    // Skip jqx placeholder rows — real rows always have a Timesheet ID
     return rawRows
       .filter((r) => (r['Timesheet ID'] ?? '').trim().length > 3)
       .map((r) => ({ WOID: sourceId, ...r }));
@@ -195,7 +195,6 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
   ctx.log(`Found ${ids.length} ID(s) to process.`);
 
   // ── 2. Determine output column order ─────────────────────────────────────────
-  // Lock to existing header if the output sheet already has one (resumed run).
   const defaultColOrder: string[] = ['WOID', 'Worker Name', ...LOCATORS.columns.map((c) => c.header)];
   let colOrder: string[] = defaultColOrder;
   {
@@ -217,8 +216,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
     }
   }
 
-  // Release input workbook — flushRows reloads the file fresh each call
-  // @ts-ignore
+  // @ts-ignore — release input workbook memory; flushRows reloads fresh each call
   inputWorkbook._worksheets = [];
 
   // ── 3. flushRows — load fresh → append → save → discard ─────────────────────
@@ -237,7 +235,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
   async function flushRows(rows: Record<string, string>[]): Promise<void> {
     if (rows.length === 0) return;
 
-    const cols = colOrder;
+    const cols      = colOrder;
     const writeStart = Date.now();
 
     const wb = new ExcelJS.Workbook();
@@ -285,7 +283,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
     ctx.log(`[${i + 1}/${ids.length}] Processing ID: ${id}`);
 
     try {
-      const searchHost  = ctx.page.locator(LOCATORS.searchInputHost);
+      const searchHost  = webCtx.page.locator(LOCATORS.searchInputHost);
       const searchInner = searchHost.locator(LOCATORS.searchInputInner);
 
       await searchInner.waitFor({ state: 'visible' });
@@ -294,9 +292,9 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
       await searchInner.fill(id);
       await searchInner.press('Enter');
 
-      await ctx.waitForVisible(LOCATORS.pageReadyProbe);
+      await webCtx.waitForVisible(LOCATORS.pageReadyProbe);
 
-      const workerName = await ctx.page
+      const workerName = await webCtx.page
         .locator(LOCATORS.workerName)
         .first()
         .textContent()
@@ -304,29 +302,29 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
         .catch(() => '');
       ctx.log(`  → Worker name: "${workerName}"`);
 
-      await ctx.click(LOCATORS.tabTimeExpense);
+      await webCtx.click(LOCATORS.tabTimeExpense);
 
-      await ctx.waitForVisible(LOCATORS.fromDateInput);
-      await ctx.clear(LOCATORS.fromDateInput);
-      await ctx.type(LOCATORS.fromDateInput, fromDate);
-      await ctx.pressKey('Tab');
+      await webCtx.waitForVisible(LOCATORS.fromDateInput);
+      await webCtx.clear(LOCATORS.fromDateInput);
+      await webCtx.type(LOCATORS.fromDateInput, fromDate);
+      await webCtx.pressKey('Tab');
 
-      await ctx.waitForVisible(LOCATORS.toDateInput);
-      await ctx.clear(LOCATORS.toDateInput);
-      await ctx.type(LOCATORS.toDateInput, toDate);
-      await ctx.pressKey('Tab');
+      await webCtx.waitForVisible(LOCATORS.toDateInput);
+      await webCtx.clear(LOCATORS.toDateInput);
+      await webCtx.type(LOCATORS.toDateInput, toDate);
+      await webCtx.pressKey('Tab');
 
-      await ctx.waitForVisible(LOCATORS.applyFilterBtn);
-      await ctx.click(LOCATORS.applyFilterBtn);
+      await webCtx.waitForVisible(LOCATORS.applyFilterBtn);
+      await webCtx.click(LOCATORS.applyFilterBtn);
 
-      const hasResults = await waitForGridReady(ctx.page, 90000);
+      const hasResults = await waitForGridReady(90000);
 
       if (!hasResults) {
         ctx.log(`  → No results for ID: ${id} — writing sentinel row.`);
         await flushRows([{ WOID: id, 'Worker Name': workerName, Status: 'No Results' }]);
         totalWritten += 1;
       } else {
-        const rows = await scrapeResultRows(ctx.page, id);
+        const rows = await scrapeResultRows(id);
         rows.forEach((r) => { r['Worker Name'] = workerName; });
         ctx.log(`  → ${rows.length} row(s) scraped for ID: ${id}`);
         await flushRows(rows);
@@ -336,8 +334,8 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
 
       if (i < ids.length - 1) {
         ctx.log(`  → Navigating home...`);
-        await ctx.click(LOCATORS.homeBtn);
-        await ctx.page.locator(LOCATORS.homeReadyProbe).waitFor({ state: 'visible' });
+        await webCtx.click(LOCATORS.homeBtn);
+        await webCtx.page.locator(LOCATORS.homeReadyProbe).waitFor({ state: 'visible' });
       }
 
     } catch (err) {
@@ -346,8 +344,8 @@ export async function searchAndExportToExcel(ctx: WalnutContext & { page: import
       totalWritten += 1;
 
       try {
-        await ctx.click(LOCATORS.homeBtn);
-        await ctx.page.locator(LOCATORS.homeReadyProbe).waitFor({ state: 'visible' });
+        await webCtx.click(LOCATORS.homeBtn);
+        await webCtx.page.locator(LOCATORS.homeReadyProbe).waitFor({ state: 'visible' });
       } catch { /* ignore — next iteration will fail early if page is broken */ }
     }
 
