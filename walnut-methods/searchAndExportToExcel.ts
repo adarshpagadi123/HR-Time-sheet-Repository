@@ -1,5 +1,6 @@
-import type { WalnutContext } from './walnut';
-import type * as ExcelJS from 'exceljs'; // type-only: erased before esbuild, never bundled
+import type { WalnutContext, WalnutWebContext } from './walnut';
+import type { Page } from '@playwright/test';
+import type * as ExcelJS from 'exceljs'; // type-only — fully erased by esbuild, zero build impact
 
 /** @walnut_method
  * name: Search IDs from Excel and Write Results to Output Sheet
@@ -10,13 +11,15 @@ import type * as ExcelJS from 'exceljs'; // type-only: erased before esbuild, ne
  * category: Data Processing
  */
 export async function searchAndExportToExcel(ctx: WalnutContext) {
-  // eval('require') is the only pattern esbuild cannot statically trace —
-  // it bypasses the bundler's dependency resolution entirely so exceljs is
-  // loaded at runtime (after the agent has installed it) rather than at build time.
-  // eslint-disable-next-line no-eval
-  const ExcelJS: typeof import('exceljs') = eval('require')('exceljs');
+  // `xl` is the runtime ExcelJS module.
+  // Loaded via new Function() so esbuild cannot statically trace the require() call
+  // and will NOT attempt to bundle/resolve 'exceljs' at build time.
+  // `import type * as ExcelJS` above provides all type annotations at zero runtime cost.
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval
+  const xl = new Function('return require')()('exceljs') as typeof ExcelJS;
 
-  const webCtx = ctx as import('./walnut').WalnutWebContext;
+  // Cast to WalnutWebContext for browser access (ctx.page, click, type, etc.)
+  const webCtx = ctx as WalnutWebContext;
 
   const filePath        = ctx.args[0];
   const inputSheetName  = ctx.args[1];
@@ -97,9 +100,10 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   }
 
   // ── Poll browser JS until a real Timesheet ID appears in the grid ────────────
-  async function waitForGridReady(timeoutMs = 90000): Promise<boolean> {
+  // Returns false if no results appear within timeoutMs (no-results ID).
+  async function waitForGridReady(page: Page, timeoutMs = 90000): Promise<boolean> {
     try {
-      await webCtx.page.waitForFunction(
+      await page.waitForFunction(
         ({ rowSel }: { rowSel: string }) => {
           const rows = document.querySelectorAll(rowSel);
           for (const row of Array.from(rows)) {
@@ -119,11 +123,14 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   }
 
   // ── Read all result rows in one page.evaluate() call ────────────────────────
-  async function scrapeResultRows(sourceId: string): Promise<Record<string, string>[]> {
+  async function scrapeResultRows(
+    page: Page,
+    sourceId: string,
+  ): Promise<Record<string, string>[]> {
     type ColDef = { index: number; header: string; child: string };
     const cols: ColDef[] = LOCATORS.columns.map((c) => ({ ...c }));
 
-    const rawRows = await webCtx.page.evaluate(
+    const rawRows = await page.evaluate(
       ({ rowSel, columns }: { rowSel: string; columns: ColDef[] }) => {
         const rowEls = document.querySelectorAll(rowSel);
         const results: Record<string, string>[] = [];
@@ -154,7 +161,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   // ── 1. Read IDs from input sheet ─────────────────────────────────────────────
   ctx.log(`Reading workbook: ${filePath}`);
 
-  const inputWorkbook = new ExcelJS.Workbook();
+  const inputWorkbook = new xl.Workbook();
   await inputWorkbook.xlsx.readFile(filePath);
 
   const inSheet = inputWorkbook.getWorksheet(inputSheetName);
@@ -216,13 +223,14 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
     }
   }
 
-  // @ts-ignore — release input workbook memory; flushRows reloads fresh each call
+  // Release input workbook — flushRows reloads the file fresh each call
+  // @ts-ignore
   inputWorkbook._worksheets = [];
 
   // ── 3. flushRows — load fresh → append → save → discard ─────────────────────
   let dataRowCounter = 0;
   {
-    const probe = new ExcelJS.Workbook();
+    const probe = new xl.Workbook();
     try {
       await probe.xlsx.readFile(filePath);
       const s = probe.getWorksheet(outputSheetName);
@@ -235,10 +243,10 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   async function flushRows(rows: Record<string, string>[]): Promise<void> {
     if (rows.length === 0) return;
 
-    const cols      = colOrder;
+    const cols = colOrder;
     const writeStart = Date.now();
 
-    const wb = new ExcelJS.Workbook();
+    const wb = new xl.Workbook();
     await wb.xlsx.readFile(filePath);
 
     let sheet = wb.getWorksheet(outputSheetName);
@@ -317,14 +325,14 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
       await webCtx.waitForVisible(LOCATORS.applyFilterBtn);
       await webCtx.click(LOCATORS.applyFilterBtn);
 
-      const hasResults = await waitForGridReady(90000);
+      const hasResults = await waitForGridReady(webCtx.page, 90000);
 
       if (!hasResults) {
         ctx.log(`  → No results for ID: ${id} — writing sentinel row.`);
         await flushRows([{ WOID: id, 'Worker Name': workerName, Status: 'No Results' }]);
         totalWritten += 1;
       } else {
-        const rows = await scrapeResultRows(id);
+        const rows = await scrapeResultRows(webCtx.page, id);
         rows.forEach((r) => { r['Worker Name'] = workerName; });
         ctx.log(`  → ${rows.length} row(s) scraped for ID: ${id}`);
         await flushRows(rows);
