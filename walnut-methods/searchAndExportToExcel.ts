@@ -9,26 +9,102 @@ import type { WalnutContext, WalnutWebContext } from './walnut';
  * category: Data Processing
  */
 export async function searchAndExportToExcel(ctx: WalnutContext) {
-  // The method is eval'd inside the Walnut Agent bundle (server.js), so
-  // __filename and import() both resolve from the bundle context — wrong place.
-  // new Function('return require')() extracts the real CJS require that is
-  // in scope of the eval without esbuild intercepting it.
-  // We then use fs to discover the live cache hash at runtime so no path
-  // is ever hardcoded.
-  const _req: NodeRequire = new Function('return require')();
-  const fs   = _req('fs')   as typeof import('fs');
-  const path = _req('path') as typeof import('path');
-  const { createRequire } = _req('module') as typeof import('module');
+  // ── Load exceljs — 3-strategy waterfall ──────────────────────────────────────
+  //
+  // The Walnut Agent executes custom methods via eval() inside its bundle
+  // (server.js). The execution context differs across agent versions:
+  //
+  //   Strategy 1 — ESM dynamic import by file:// URL  (agent v0.4.645+ / ESM)
+  //     node: built-ins always resolve to Node core regardless of the bundle.
+  //     We discover the live cache hash via node:fs, build the absolute path
+  //     to exceljs/index.js, and import() it by file:// URL.
+  //     Fails if: require is available (CJS eval context) or cache not found.
+  //
+  //   Strategy 2 — createRequire from cache package.json  (CJS eval, require available)
+  //     new Function('return require')() extracts the CJS require in scope of
+  //     the eval without esbuild intercepting it. We then point createRequire
+  //     at the cache package.json so Node resolves from that directory.
+  //     Fails if: require is not defined (ESM context).
+  //
+  //   Strategy 3 — bare require('exceljs')  (CJS eval, package already on path)
+  //     Last resort for environments where exceljs happens to be resolvable
+  //     from the default module path (e.g. installed at repo root node_modules
+  //     and the eval CWD is the repo root).
+  //
+  // Each strategy is tried in order; the first one that succeeds wins.
+  // All errors from failing strategies are logged via ctx.log so you can
+  // see exactly which path succeeded in the run log.
 
-  const cacheBase = path.join(
-    process.env.HOME ?? '/Users/santhosh.m01',
-    'Library/Application Support/WalnutAgent/custom-methods-cache',
-  );
-  const hashDir = fs.readdirSync(cacheBase).find((d: string) => /^[0-9a-f]{24}$/.test(d));
-  if (!hashDir) throw new Error(`No cache directory found under ${cacheBase}`);
+  let xl: any;
+  const errors: string[] = [];
 
-  const methodsDir = path.join(cacheBase, hashDir, 'HR-Time-sheet-Repository', 'walnut-methods');
-  const xl: any = createRequire(path.join(methodsDir, 'package.json'))('exceljs');
+  // ── Strategy 1: ESM — node: built-ins + file:// dynamic import ───────────────
+  try {
+    const { default: _fs }  = await import('node:fs');
+    const { default: _path } = await import('node:path');
+    const { pathToFileURL }  = await import('node:url');
+
+    const cacheBase = _path.join(
+      process.env.HOME ?? '/Users/santhosh.m01',
+      'Library/Application Support/WalnutAgent/custom-methods-cache',
+    );
+    const hashDir = _fs.readdirSync(cacheBase).find((d: string) => /^[0-9a-f]{24}$/.test(d));
+    if (!hashDir) throw new Error(`No cache hash dir found under ${cacheBase}`);
+
+    const excelJsEntry = _path.join(
+      cacheBase, hashDir, 'HR-Time-sheet-Repository',
+      'walnut-methods', 'node_modules', 'exceljs', 'lib', 'exceljs.nodejs.js',
+    );
+    if (!_fs.existsSync(excelJsEntry)) throw new Error(`exceljs entry not found: ${excelJsEntry}`);
+
+    const mod = await import(pathToFileURL(excelJsEntry).href);
+    xl = mod.default ?? mod;
+    ctx.log('[exceljs] loaded via Strategy 1 (ESM file:// import)');
+  } catch (e1) {
+    errors.push(`S1: ${e1}`);
+  }
+
+  // ── Strategy 2: CJS eval — new Function('return require')() + createRequire ──
+  if (!xl) {
+    try {
+      const _req: any = new Function('return require')();
+      const _fs   = _req('fs');
+      const _path = _req('path');
+      const { createRequire } = _req('module');
+
+      const cacheBase = _path.join(
+        process.env.HOME ?? '/Users/santhosh.m01',
+        'Library/Application Support/WalnutAgent/custom-methods-cache',
+      );
+      const hashDir = _fs.readdirSync(cacheBase).find((d: string) => /^[0-9a-f]{24}$/.test(d));
+      if (!hashDir) throw new Error(`No cache hash dir found under ${cacheBase}`);
+
+      const methodsDir = _path.join(
+        cacheBase, hashDir, 'HR-Time-sheet-Repository', 'walnut-methods',
+      );
+      xl = createRequire(_path.join(methodsDir, 'package.json'))('exceljs');
+      ctx.log('[exceljs] loaded via Strategy 2 (CJS createRequire from cache)');
+    } catch (e2) {
+      errors.push(`S2: ${e2}`);
+    }
+  }
+
+  // ── Strategy 3: bare require — last resort ────────────────────────────────────
+  if (!xl) {
+    try {
+      const _req: any = new Function('return require')();
+      xl = _req('exceljs');
+      ctx.log('[exceljs] loaded via Strategy 3 (bare require)');
+    } catch (e3) {
+      errors.push(`S3: ${e3}`);
+    }
+  }
+
+  if (!xl) {
+    throw new Error(
+      'Failed to load exceljs after all strategies:\n' + errors.join('\n'),
+    );
+  }
 
   const webCtx = ctx as WalnutWebContext;
 
