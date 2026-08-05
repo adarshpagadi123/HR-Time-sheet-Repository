@@ -9,17 +9,12 @@ import type { WalnutContext, WalnutWebContext } from './walnut';
  * category: Data Processing
  */
 export async function searchAndExportToExcel(ctx: WalnutContext) {
-  // createRequire with absolute cache path — forces Node to resolve 'exceljs'
-  // from the cache node_modules, not from app.asar (the Walnut Agent bundle).
-  // 'module' is a Node built-in so esbuild does NOT bundle it.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  // Dynamic require via createRequire(__filename) so Node resolves 'exceljs'
+  // from the live cache directory regardless of the cache hash.
+  // import('module') is a Node built-in — esbuild does not bundle it.
   const { createRequire } = await import('module');
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const xl: any = createRequire(
-    '/Users/santhosh.m01/Library/Application Support/WalnutAgent/custom-methods-cache/6a70658b1c9c6637181143a4/HR-Time-sheet-Repository/walnut-methods/package.json'
-  )('exceljs');
+  const xl: any = createRequire(__filename)('exceljs');
 
-  // Cast to WalnutWebContext for browser access (ctx.page, click, type, etc.)
   const webCtx = ctx as WalnutWebContext;
 
   const filePath        = ctx.args[0];
@@ -29,7 +24,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   const toDate          = ctx.args[4];
   const outputSheetName = ctx.args[5];
 
-  // ── LOCATORS — edit here when the DOM changes, nowhere else ─────────────────
+  // ── LOCATORS ──────────────────────────────────────────────────────────────────
   const LOCATORS = {
     searchInputHost:  'ui5-input#searchFieldInput',
     searchInputInner: 'input#inner',
@@ -52,66 +47,53 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
       { index: 10, header: 'Amount (INR)',   child: 'div.jqx-grid-cell-left-align' },
     ],
     workerName:     'h1[data-help-id="TITLE_270"] span.titlePrimary',
-    pageReadyProbe: '//a[@id="tab_timeAndExpense"]',
     homeBtn:        '//li[@id="homeMenuTitle"]//a[@title="Home"]',
     homeReadyProbe: 'ui5-input#searchFieldInput',
   } as const;
 
-  // ── Resolve ExcelJS cell value to plain string ───────────────────────────────
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // ── Helpers ───────────────────────────────────────────────────────────────────
+
   function cellText(value: any): string {
     if (value === null || value === undefined) return '';
     if (typeof value === 'object') {
-      if ('result' in value) return String(value.result ?? '');
+      if ('result'   in value) return String(value.result ?? '');
       if ('richText' in value) return value.richText.map((r: any) => r.text).join('');
-      if ('text'    in value) return value.text;
+      if ('text'     in value) return value.text;
       if (value instanceof Date) return value.toISOString().slice(0, 10);
     }
     return String(value);
   }
 
-  // ── Bold + light-blue header row ─────────────────────────────────────────────
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function styleHeaderRow(row: any, colCount: number): void {
     for (let c = 1; c <= colCount; c++) {
       const cell = row.getCell(c);
       cell.font      = { bold: true };
       cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9E1F2' } };
-      cell.border    = {
-        top: { style: 'thin' }, left: { style: 'thin' },
-        bottom: { style: 'thin' }, right: { style: 'thin' },
-      };
+      cell.border    = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
       cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
     }
     row.commit();
   }
 
-  // ── Alternating white/grey data row ─────────────────────────────────────────
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function styleDataRow(row: any, colCount: number, dataIndex: number): void {
     const bgColor = dataIndex % 2 === 0 ? 'FFFFFFFF' : 'FFF2F2F2';
     for (let c = 1; c <= colCount; c++) {
       const cell = row.getCell(c);
       cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgColor } };
-      cell.border    = {
-        top: { style: 'thin' }, left: { style: 'thin' },
-        bottom: { style: 'thin' }, right: { style: 'thin' },
-      };
+      cell.border    = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
       cell.alignment = { vertical: 'middle', wrapText: true };
     }
     row.commit();
   }
 
-  // ── Poll browser JS until a real Timesheet ID appears in the grid ────────────
-  // Returns false if no results appear within timeoutMs (no-results ID).
+  // Polls until a real Timesheet ID (title length > 3) appears in the grid.
+  // Returns false if nothing appears within the timeout (no results for this ID).
   async function waitForGridReady(timeoutMs = 90000): Promise<boolean> {
     try {
       await webCtx.page.waitForFunction(
         ({ rowSel }: { rowSel: string }) => {
-          const rows = document.querySelectorAll(rowSel);
-          for (const row of Array.from(rows)) {
-            const cell = row.querySelector('div[columnindex="1"][role="gridcell"]');
-            const title = cell?.getAttribute('title') ?? '';
+          for (const row of Array.from(document.querySelectorAll(rowSel))) {
+            const title = row.querySelector('div[columnindex="1"][role="gridcell"]')?.getAttribute('title') ?? '';
             if (title.trim().length > 3) return true;
           }
           return false;
@@ -125,29 +107,24 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
     }
   }
 
-  // ── Read all result rows in one page.evaluate() call ────────────────────────
+  // Reads all visible result rows in a single page.evaluate() call.
   async function scrapeResultRows(sourceId: string): Promise<Record<string, string>[]> {
     type ColDef = { index: number; header: string; child: string };
     const cols: ColDef[] = LOCATORS.columns.map((c) => ({ ...c }));
 
     const rawRows = await webCtx.page.evaluate(
       ({ rowSel, columns }: { rowSel: string; columns: ColDef[] }) => {
-        const rowEls = document.querySelectorAll(rowSel);
         const results: Record<string, string>[] = [];
-
-        rowEls.forEach((rowEl) => {
+        document.querySelectorAll(rowSel).forEach((rowEl) => {
           const record: Record<string, string> = {};
           columns.forEach(({ index, header, child }) => {
             const cell = rowEl.querySelector(`div[columnindex="${index}"][role="gridcell"]`);
             if (!cell) { record[header] = ''; return; }
             const title = (cell.getAttribute('title') ?? '').trim();
-            if (title !== '') { record[header] = title; return; }
-            const childEl = cell.querySelector(child);
-            record[header] = (childEl?.textContent ?? '').trim();
+            record[header] = title !== '' ? title : (cell.querySelector(child)?.textContent ?? '').trim();
           });
           results.push(record);
         });
-
         return results;
       },
       { rowSel: LOCATORS.resultRow, columns: cols },
@@ -158,7 +135,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
       .map((r) => ({ WOID: sourceId, ...r }));
   }
 
-  // ── 1. Read IDs from input sheet ─────────────────────────────────────────────
+  // ── 1. Read IDs from input sheet ──────────────────────────────────────────────
   ctx.log(`Reading workbook: ${filePath}`);
 
   const inputWorkbook = new xl.Workbook();
@@ -167,7 +144,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   const inSheet = inputWorkbook.getWorksheet(inputSheetName);
   if (!inSheet) {
     const available = inputWorkbook.worksheets.map((ws: any) => ws.name).join(', ');
-    throw new Error(`Input sheet "${inputSheetName}" not found. Available sheets: ${available}`);
+    throw new Error(`Input sheet "${inputSheetName}" not found. Available: ${available}`);
   }
 
   const headerRow  = inSheet.getRow(1);
@@ -180,13 +157,8 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
 
   if (idColIndex === -1) {
     const found: string[] = [];
-    headerRow.eachCell({ includeEmpty: false }, (cell: any) =>
-      found.push(String(cell.value ?? '')),
-    );
-    throw new Error(
-      `Column "${idColumnName}" not found in row 1 of sheet "${inputSheetName}". ` +
-      `Found headers: ${found.join(', ')}`,
-    );
+    headerRow.eachCell({ includeEmpty: false }, (cell: any) => found.push(String(cell.value ?? '')));
+    throw new Error(`Column "${idColumnName}" not found in "${inputSheetName}". Found: ${found.join(', ')}`);
   }
 
   const ids: string[] = [];
@@ -201,88 +173,63 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   }
   ctx.log(`Found ${ids.length} ID(s) to process.`);
 
-  // ── 2. Determine output column order ─────────────────────────────────────────
+  // ── 2. Determine output column order + seed dataRowCounter ───────────────────
   const defaultColOrder: string[] = ['WOID', 'Worker Name', ...LOCATORS.columns.map((c) => c.header)];
-  let colOrder: string[] = defaultColOrder;
-  {
-    const existingSheet = inputWorkbook.getWorksheet(outputSheetName);
-    if (existingSheet) {
-      const hRow = existingSheet.getRow(1);
-      const hdrs: string[] = [];
-      hRow.eachCell({ includeEmpty: false }, (cell: any) => {
-        hdrs.push(String(cell.value ?? ''));
-      });
-      if (hdrs.length > 0) {
-        colOrder = hdrs;
-        ctx.log(`Output sheet "${outputSheetName}" found — column order locked from header row.`);
-      } else {
-        ctx.log(`Output sheet "${outputSheetName}" found but has no header — will write header on first flush.`);
-      }
+  let colOrder: string[]          = defaultColOrder;
+  let dataRowCounter              = 0;
+
+  const existingSheet = inputWorkbook.getWorksheet(outputSheetName);
+  if (existingSheet) {
+    const hdrs: string[] = [];
+    existingSheet.getRow(1).eachCell({ includeEmpty: false }, (cell: any) => {
+      hdrs.push(String(cell.value ?? ''));
+    });
+    if (hdrs.length > 0) {
+      colOrder       = hdrs;
+      dataRowCounter = Math.max(0, existingSheet.rowCount - 1);
+      ctx.log(`Output sheet "${outputSheetName}" exists — ${dataRowCounter} existing data row(s), column order locked.`);
     } else {
-      ctx.log(`Output sheet "${outputSheetName}" not found — will create it on first flush.`);
+      ctx.log(`Output sheet "${outputSheetName}" exists but has no header — will write header on first flush.`);
     }
+  } else {
+    ctx.log(`Output sheet "${outputSheetName}" not found — will create it on first flush.`);
   }
 
-  // @ts-ignore — release input workbook memory; flushRows reloads fresh each call
-  inputWorkbook._worksheets = [];
-
-  // ── 3. flushRows — load fresh → append → save → discard ─────────────────────
-  let dataRowCounter = 0;
-  {
-    const probe = new xl.Workbook();
-    try {
-      await probe.xlsx.readFile(filePath);
-      const s = probe.getWorksheet(outputSheetName);
-      if (s && s.rowCount > 1) {
-        dataRowCounter = s.rowCount - 1;
-      }
-    } catch { /* output sheet may not exist yet */ }
-  }
-
+  // ── 3. flushRows — reload workbook → append rows → save ──────────────────────
   async function flushRows(rows: Record<string, string>[]): Promise<void> {
     if (rows.length === 0) return;
 
-    const cols      = colOrder;
-    const writeStart = Date.now();
-
-    const wb = new xl.Workbook();
+    const start = Date.now();
+    const wb    = new xl.Workbook();
     await wb.xlsx.readFile(filePath);
 
     let sheet = wb.getWorksheet(outputSheetName);
     if (!sheet) {
       sheet = wb.addWorksheet(outputSheetName);
-      sheet.columns = cols.map((h: string) => ({
-        width: Math.min(40, Math.max(14, h.length + 4)),
-      }));
-      ctx.log(`Created output sheet "${outputSheetName}".`);
+      sheet.columns = colOrder.map((h: string) => ({ width: Math.min(40, Math.max(14, h.length + 4)) }));
     }
 
-    const cell1     = sheet.getRow(1).getCell(1);
-    const hasHeader = cell1.value !== null && cell1.value !== undefined && cell1.value !== '';
+    const hasHeader = sheet.getRow(1).getCell(1).value != null && sheet.getRow(1).getCell(1).value !== '';
     if (!hasHeader) {
       const hRow = sheet.getRow(1);
-      cols.forEach((h: string, idx: number) => { hRow.getCell(idx + 1).value = h; });
-      styleHeaderRow(hRow, cols.length);
-      ctx.log(`Written header row to sheet "${outputSheetName}".`);
+      colOrder.forEach((h: string, idx: number) => { hRow.getCell(idx + 1).value = h; });
+      styleHeaderRow(hRow, colOrder.length);
     }
 
     const nextRow = sheet.rowCount + 1;
     rows.forEach((record, idx) => {
       const row = sheet!.getRow(nextRow + idx);
-      cols.forEach((h: string, colIdx: number) => {
-        row.getCell(colIdx + 1).value = record[h] ?? '';
-      });
-      styleDataRow(row, cols.length, dataRowCounter + idx);
+      colOrder.forEach((h: string, colIdx: number) => { row.getCell(colIdx + 1).value = record[h] ?? ''; });
+      styleDataRow(row, colOrder.length, dataRowCounter + idx);
       row.commit();
     });
 
     dataRowCounter += rows.length;
     await wb.xlsx.writeFile(filePath);
-
-    ctx.log(`[FLUSH] ${rows.length} row(s) written in ${Date.now() - writeStart}ms`);
+    ctx.log(`[FLUSH] ${rows.length} row(s) written in ${Date.now() - start}ms`);
   }
 
-  // ── 4. Main loop ─────────────────────────────────────────────────────────────
+  // ── 4. Main loop ──────────────────────────────────────────────────────────────
   let totalWritten = 0;
 
   for (let i = 0; i < ids.length; i++) {
@@ -290,24 +237,17 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
     ctx.log(`[${i + 1}/${ids.length}] Processing ID: ${id}`);
 
     try {
-      const searchHost  = webCtx.page.locator(LOCATORS.searchInputHost);
-      const searchInner = searchHost.locator(LOCATORS.searchInputInner);
-
+      const searchInner = webCtx.page.locator(LOCATORS.searchInputHost).locator(LOCATORS.searchInputInner);
       await searchInner.waitFor({ state: 'visible' });
-      await searchInner.click();
       await searchInner.click({ clickCount: 3 });
       await searchInner.fill(id);
       await searchInner.press('Enter');
 
-      await webCtx.waitForVisible(LOCATORS.pageReadyProbe);
+      await webCtx.waitForVisible(LOCATORS.tabTimeExpense);
 
-      const workerName = await webCtx.page
-        .locator(LOCATORS.workerName)
-        .first()
-        .textContent()
-        .then((t: string | null) => t?.trim() ?? '')
-        .catch(() => '');
-      ctx.log(`  → Worker name: "${workerName}"`);
+      const workerName = await webCtx.page.locator(LOCATORS.workerName).first()
+        .textContent().then((t: string | null) => t?.trim() ?? '').catch(() => '');
+      ctx.log(`  → Worker: "${workerName}"`);
 
       await webCtx.click(LOCATORS.tabTimeExpense);
 
@@ -324,43 +264,36 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
       await webCtx.waitForVisible(LOCATORS.applyFilterBtn);
       await webCtx.click(LOCATORS.applyFilterBtn);
 
-      const hasResults = await waitForGridReady(90000);
+      const hasResults = await waitForGridReady();
 
       if (!hasResults) {
-        ctx.log(`  → No results for ID: ${id} — writing sentinel row.`);
+        ctx.log(`  → No results — writing sentinel row.`);
         await flushRows([{ WOID: id, 'Worker Name': workerName, Status: 'No Results' }]);
         totalWritten += 1;
       } else {
         const rows = await scrapeResultRows(id);
         rows.forEach((r) => { r['Worker Name'] = workerName; });
-        ctx.log(`  → ${rows.length} row(s) scraped for ID: ${id}`);
+        ctx.log(`  → ${rows.length} row(s) scraped.`);
         await flushRows(rows);
         totalWritten += rows.length;
-        ctx.log(`  → Saved. Total rows written so far: ${totalWritten}`);
       }
 
       if (i < ids.length - 1) {
-        ctx.log(`  → Navigating home...`);
         await webCtx.click(LOCATORS.homeBtn);
         await webCtx.page.locator(LOCATORS.homeReadyProbe).waitFor({ state: 'visible' });
+        await new Promise((resolve) => setTimeout(resolve, 300));
       }
 
     } catch (err) {
-      ctx.log(`  Error processing ID "${id}": ${String(err)}`);
+      ctx.log(`  Error on "${id}": ${String(err)}`);
       await flushRows([{ WOID: id, error: String(err) }]);
       totalWritten += 1;
-
       try {
         await webCtx.click(LOCATORS.homeBtn);
         await webCtx.page.locator(LOCATORS.homeReadyProbe).waitFor({ state: 'visible' });
-      } catch { /* ignore — next iteration will fail early if page is broken */ }
-    }
-
-    if (i < ids.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      } catch { /* best-effort recovery */ }
     }
   }
 
-  const fileName = filePath.replace(/\\/g, '/').split('/').pop() ?? filePath;
-  ctx.log(`Done. ${totalWritten} total row(s) written to "${outputSheetName}" in ${fileName}.`);
+  ctx.log(`Done. ${totalWritten} total row(s) written to "${outputSheetName}" in ${filePath.split('/').pop()}.`);
 }
