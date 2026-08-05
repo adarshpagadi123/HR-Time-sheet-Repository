@@ -1,8 +1,7 @@
 import type { WalnutContext } from './walnut';
-import type { Page } from '@playwright/test';
-import { createRequire } from 'module';
-const _require = createRequire(import.meta.url);
-const ExcelJS: typeof import('exceljs') = _require('exceljs');
+import type { Page } from 'playwright';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const ExcelJS: typeof import('exceljs') = require('exceljs');
 
 /** @walnut_method
  * name: Search IDs from Excel and Write Results to Output Sheet
