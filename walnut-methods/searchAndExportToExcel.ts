@@ -1,5 +1,8 @@
 import type { WalnutContext } from './walnut';
 import type { Page } from '@playwright/test';
+import { createRequire } from 'module';
+const _require = createRequire(import.meta.url);
+const ExcelJS: typeof import('exceljs') = _require('exceljs');
 
 /** @walnut_method
  * name: Search IDs from Excel and Write Results to Output Sheet
@@ -10,8 +13,6 @@ import type { Page } from '@playwright/test';
  * category: Data Processing
  */
 export async function searchAndExportToExcel(ctx: WalnutContext) {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const ExcelJS = await import('exceljs');
   const filePath        = ctx.args[0];
   const inputSheetName  = ctx.args[1];
   const idColumnName    = ctx.args[2];
