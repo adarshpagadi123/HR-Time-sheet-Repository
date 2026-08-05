@@ -1,6 +1,4 @@
 import type { WalnutContext, WalnutWebContext } from './walnut';
-import type { Page } from '@playwright/test';
-import type * as ExcelJS from 'exceljs'; // type-only — fully erased by esbuild, zero build impact
 
 /** @walnut_method
  * name: Search IDs from Excel and Write Results to Output Sheet
@@ -11,12 +9,12 @@ import type * as ExcelJS from 'exceljs'; // type-only — fully erased by esbuil
  * category: Data Processing
  */
 export async function searchAndExportToExcel(ctx: WalnutContext) {
-  // `xl` is the runtime ExcelJS module.
-  // Loaded via new Function() so esbuild cannot statically trace the require() call
-  // and will NOT attempt to bundle/resolve 'exceljs' at build time.
-  // `import type * as ExcelJS` above provides all type annotations at zero runtime cost.
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval
-  const xl = new Function('return require')()('exceljs') as typeof ExcelJS;
+  // Dynamic import via variable — esbuild only traces import('literal-string'),
+  // not import(variable), so it never tries to bundle/resolve 'exceljs' at build time.
+  // The Walnut Agent runtime is ESM so await import() is the correct loader.
+  const _pkg = 'exceljs';
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const xl: any = await import(_pkg);
 
   // Cast to WalnutWebContext for browser access (ctx.page, click, type, etc.)
   const webCtx = ctx as WalnutWebContext;
@@ -57,20 +55,21 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   } as const;
 
   // ── Resolve ExcelJS cell value to plain string ───────────────────────────────
-  function cellText(value: ExcelJS.CellValue): string {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function cellText(value: any): string {
     if (value === null || value === undefined) return '';
     if (typeof value === 'object') {
-      if ('result' in value) return String((value as ExcelJS.CellFormulaValue).result ?? '');
-      if ('richText' in value)
-        return (value as ExcelJS.CellRichTextValue).richText.map((r) => r.text).join('');
-      if ('text' in value) return (value as ExcelJS.CellHyperlinkValue).text;
+      if ('result' in value) return String(value.result ?? '');
+      if ('richText' in value) return value.richText.map((r: any) => r.text).join('');
+      if ('text'    in value) return value.text;
       if (value instanceof Date) return value.toISOString().slice(0, 10);
     }
     return String(value);
   }
 
   // ── Bold + light-blue header row ─────────────────────────────────────────────
-  function styleHeaderRow(row: ExcelJS.Row, colCount: number): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function styleHeaderRow(row: any, colCount: number): void {
     for (let c = 1; c <= colCount; c++) {
       const cell = row.getCell(c);
       cell.font      = { bold: true };
@@ -85,7 +84,8 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   }
 
   // ── Alternating white/grey data row ─────────────────────────────────────────
-  function styleDataRow(row: ExcelJS.Row, colCount: number, dataIndex: number): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function styleDataRow(row: any, colCount: number, dataIndex: number): void {
     const bgColor = dataIndex % 2 === 0 ? 'FFFFFFFF' : 'FFF2F2F2';
     for (let c = 1; c <= colCount; c++) {
       const cell = row.getCell(c);
@@ -101,9 +101,9 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
 
   // ── Poll browser JS until a real Timesheet ID appears in the grid ────────────
   // Returns false if no results appear within timeoutMs (no-results ID).
-  async function waitForGridReady(page: Page, timeoutMs = 90000): Promise<boolean> {
+  async function waitForGridReady(timeoutMs = 90000): Promise<boolean> {
     try {
-      await page.waitForFunction(
+      await webCtx.page.waitForFunction(
         ({ rowSel }: { rowSel: string }) => {
           const rows = document.querySelectorAll(rowSel);
           for (const row of Array.from(rows)) {
@@ -123,14 +123,11 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   }
 
   // ── Read all result rows in one page.evaluate() call ────────────────────────
-  async function scrapeResultRows(
-    page: Page,
-    sourceId: string,
-  ): Promise<Record<string, string>[]> {
+  async function scrapeResultRows(sourceId: string): Promise<Record<string, string>[]> {
     type ColDef = { index: number; header: string; child: string };
     const cols: ColDef[] = LOCATORS.columns.map((c) => ({ ...c }));
 
-    const rawRows = await page.evaluate(
+    const rawRows = await webCtx.page.evaluate(
       ({ rowSel, columns }: { rowSel: string; columns: ColDef[] }) => {
         const rowEls = document.querySelectorAll(rowSel);
         const results: Record<string, string>[] = [];
@@ -166,13 +163,13 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
 
   const inSheet = inputWorkbook.getWorksheet(inputSheetName);
   if (!inSheet) {
-    const available = inputWorkbook.worksheets.map((ws: ExcelJS.Worksheet) => ws.name).join(', ');
+    const available = inputWorkbook.worksheets.map((ws: any) => ws.name).join(', ');
     throw new Error(`Input sheet "${inputSheetName}" not found. Available sheets: ${available}`);
   }
 
   const headerRow  = inSheet.getRow(1);
   let   idColIndex = -1;
-  headerRow.eachCell({ includeEmpty: false }, (cell: ExcelJS.Cell, colIdx: number) => {
+  headerRow.eachCell({ includeEmpty: false }, (cell: any, colIdx: number) => {
     if (String(cell.value ?? '').trim().toLowerCase() === idColumnName.trim().toLowerCase()) {
       idColIndex = colIdx;
     }
@@ -180,7 +177,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
 
   if (idColIndex === -1) {
     const found: string[] = [];
-    headerRow.eachCell({ includeEmpty: false }, (cell: ExcelJS.Cell) =>
+    headerRow.eachCell({ includeEmpty: false }, (cell: any) =>
       found.push(String(cell.value ?? '')),
     );
     throw new Error(
@@ -190,7 +187,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   }
 
   const ids: string[] = [];
-  inSheet.eachRow({ includeEmpty: false }, (row: ExcelJS.Row, rowNumber: number) => {
+  inSheet.eachRow({ includeEmpty: false }, (row: any, rowNumber: number) => {
     if (rowNumber === 1) return;
     const val = cellText(row.getCell(idColIndex).value).trim();
     if (val !== '') ids.push(val);
@@ -209,7 +206,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
     if (existingSheet) {
       const hRow = existingSheet.getRow(1);
       const hdrs: string[] = [];
-      hRow.eachCell({ includeEmpty: false }, (cell: ExcelJS.Cell) => {
+      hRow.eachCell({ includeEmpty: false }, (cell: any) => {
         hdrs.push(String(cell.value ?? ''));
       });
       if (hdrs.length > 0) {
@@ -223,8 +220,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
     }
   }
 
-  // Release input workbook — flushRows reloads the file fresh each call
-  // @ts-ignore
+  // @ts-ignore — release input workbook memory; flushRows reloads fresh each call
   inputWorkbook._worksheets = [];
 
   // ── 3. flushRows — load fresh → append → save → discard ─────────────────────
@@ -243,7 +239,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
   async function flushRows(rows: Record<string, string>[]): Promise<void> {
     if (rows.length === 0) return;
 
-    const cols = colOrder;
+    const cols      = colOrder;
     const writeStart = Date.now();
 
     const wb = new xl.Workbook();
@@ -252,7 +248,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
     let sheet = wb.getWorksheet(outputSheetName);
     if (!sheet) {
       sheet = wb.addWorksheet(outputSheetName);
-      sheet.columns = cols.map((h) => ({
+      sheet.columns = cols.map((h: string) => ({
         width: Math.min(40, Math.max(14, h.length + 4)),
       }));
       ctx.log(`Created output sheet "${outputSheetName}".`);
@@ -262,7 +258,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
     const hasHeader = cell1.value !== null && cell1.value !== undefined && cell1.value !== '';
     if (!hasHeader) {
       const hRow = sheet.getRow(1);
-      cols.forEach((h, idx) => { hRow.getCell(idx + 1).value = h; });
+      cols.forEach((h: string, idx: number) => { hRow.getCell(idx + 1).value = h; });
       styleHeaderRow(hRow, cols.length);
       ctx.log(`Written header row to sheet "${outputSheetName}".`);
     }
@@ -270,7 +266,7 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
     const nextRow = sheet.rowCount + 1;
     rows.forEach((record, idx) => {
       const row = sheet!.getRow(nextRow + idx);
-      cols.forEach((h, colIdx) => {
+      cols.forEach((h: string, colIdx: number) => {
         row.getCell(colIdx + 1).value = record[h] ?? '';
       });
       styleDataRow(row, cols.length, dataRowCounter + idx);
@@ -325,14 +321,14 @@ export async function searchAndExportToExcel(ctx: WalnutContext) {
       await webCtx.waitForVisible(LOCATORS.applyFilterBtn);
       await webCtx.click(LOCATORS.applyFilterBtn);
 
-      const hasResults = await waitForGridReady(webCtx.page, 90000);
+      const hasResults = await waitForGridReady(90000);
 
       if (!hasResults) {
         ctx.log(`  → No results for ID: ${id} — writing sentinel row.`);
         await flushRows([{ WOID: id, 'Worker Name': workerName, Status: 'No Results' }]);
         totalWritten += 1;
       } else {
-        const rows = await scrapeResultRows(webCtx.page, id);
+        const rows = await scrapeResultRows(id);
         rows.forEach((r) => { r['Worker Name'] = workerName; });
         ctx.log(`  → ${rows.length} row(s) scraped for ID: ${id}`);
         await flushRows(rows);
