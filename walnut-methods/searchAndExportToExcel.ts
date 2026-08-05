@@ -9,11 +9,26 @@ import type { WalnutContext, WalnutWebContext } from './walnut';
  * category: Data Processing
  */
 export async function searchAndExportToExcel(ctx: WalnutContext) {
-  // Dynamic require via createRequire(__filename) so Node resolves 'exceljs'
-  // from the live cache directory regardless of the cache hash.
-  // import('module') is a Node built-in — esbuild does not bundle it.
-  const { createRequire } = await import('module');
-  const xl: any = createRequire(__filename)('exceljs');
+  // The method is eval'd inside the Walnut Agent bundle (server.js), so
+  // __filename and import() both resolve from the bundle context — wrong place.
+  // new Function('return require')() extracts the real CJS require that is
+  // in scope of the eval without esbuild intercepting it.
+  // We then use fs to discover the live cache hash at runtime so no path
+  // is ever hardcoded.
+  const _req: NodeRequire = new Function('return require')();
+  const fs   = _req('fs')   as typeof import('fs');
+  const path = _req('path') as typeof import('path');
+  const { createRequire } = _req('module') as typeof import('module');
+
+  const cacheBase = path.join(
+    process.env.HOME ?? '/Users/santhosh.m01',
+    'Library/Application Support/WalnutAgent/custom-methods-cache',
+  );
+  const hashDir = fs.readdirSync(cacheBase).find((d: string) => /^[0-9a-f]{24}$/.test(d));
+  if (!hashDir) throw new Error(`No cache directory found under ${cacheBase}`);
+
+  const methodsDir = path.join(cacheBase, hashDir, 'HR-Time-sheet-Repository', 'walnut-methods');
+  const xl: any = createRequire(path.join(methodsDir, 'package.json'))('exceljs');
 
   const webCtx = ctx as WalnutWebContext;
 
