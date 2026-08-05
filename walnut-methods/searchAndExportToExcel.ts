@@ -1,6 +1,6 @@
 import type { WalnutWebContext } from './walnut';
-import type { Page } from 'playwright';
-import ExcelJS from 'exceljs';
+import type { Page } from '@playwright/test';
+import * as ExcelJS from 'exceljs';
 
 /** @walnut_method
  * name: Search IDs from Excel and Write Results to Output Sheet
