@@ -9,12 +9,10 @@ import type { WalnutContext, WalnutWebContext } from './walnut';
  * category: Data Processing
  */
 export async function searchAndExportToExcel(ctx: WalnutContext) {
-  // Dynamic import via variable — esbuild only traces import('literal-string'),
-  // not import(variable), so it never tries to bundle/resolve 'exceljs' at build time.
-  // The Walnut Agent runtime is ESM so await import() is the correct loader.
-  const _pkg = 'exceljs';
+  // String is built at runtime so esbuild cannot constant-fold it into a
+  // traceable literal — esbuild only resolves import('literal'), never import(expr).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const xl: any = await import(_pkg);
+  const xl: any = await import(['excel', 'js'].join(''));
 
   // Cast to WalnutWebContext for browser access (ctx.page, click, type, etc.)
   const webCtx = ctx as WalnutWebContext;
