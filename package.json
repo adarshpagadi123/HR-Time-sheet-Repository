@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "postinstall": "cd walnut-methods && npm install"
+  },
   "devDependencies": {
     "@playwright/mcp": "^0.0.78",
     "@playwright/test": "latest",
