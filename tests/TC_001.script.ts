@@ -1,507 +1,759 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, Page, BrowserContext } from '@playwright/test';
 import * as ExcelJS from 'exceljs';
 import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
+import axios from 'axios';
 
-/**
- * Hr Time Sheet Format — All WOs
- * 1. Read all WOIDs + Worker Names from the "WO" sheet in FieldGlass.xlsx
- * 2. Login to SAP Fieldglass once
- * 3. For each WOID: search → Time & Expense tab → set 01/07/2026–31/07/2026 → Apply Filters → extract rows
- * 4. Write all rows to "01-Jul-2026_31-Jul-2026" sheet
- */
+// ─── Config ────────────────────────────────────────────────────────────────────
+const TENANT_ID     = process.env.TENANT_ID     || 'faa3f9fc-9b37-406b-b37d-58a9f045c17a';
+const CLIENT_ID     = process.env.CLIENT_ID     || '753ed0ae-e240-4397-92fe-8f05171a0e32';
+const CLIENT_SECRET = process.env.CLIENT_SECRET || '';   // set via env var — do not hardcode
+const ONEDRIVE_USER = process.env.ONEDRIVE_USER || 'adarsh.pagadi@simplify3x.com';
+const ONEDRIVE_ITEM = '01KUWJBDDPQHXJHEKAU5BLW3VEAJ7GKEBI';
+const SHARING_URL   = 'https://simplify3xsoftware-my.sharepoint.com/:x:/g/personal/adarsh_pagadi_simplify3x_com/IQBvge6TkUCnQrtupAJ-ZRAoAfhLxv3atyfMDbLuuvW5ZuI?e=cGyLZG';
 
-const XLSX_PATH = path.resolve(__dirname, '../FieldGlass.xlsx');
-const SHEET_NAME = '01-Jul-2026_31-Jul-2026';
-const FROM_DATE  = '01/07/2026';
-const TO_DATE    = '31/07/2026';
+const XLSX_PATH       = path.join(os.tmpdir(), 'FieldGlass_temp.xlsx');
+const CHECKPOINT_PATH = path.join(os.tmpdir(), 'fg_checkpoint.json');
+const FROM_DATE       = '01/07/2026';
+const TO_DATE         = '31/07/2026';
+const SHEET_NAME      = '01-Jul-2026_31-Jul-2026';
+const SUMMARY_SHEET   = 'Summary';
+const FIELDS_SHEET    = 'fields';
+const SAP_EXPECTED_ST = 40;
 
-// Output column headers (matches existing sheet format)
-const OUTPUT_HEADERS = [
-  'WOID', 'Worker Name', 'Timesheet ID', 'Status',
-  'Start Date', 'End Date', 'Approved Date',
-  'ST Hours', 'OT Hours', 'DT Hours', 'Others Hours', 'NB Hours',
-  'Amount (INR)',
-];
+// ─── Slice control ─────────────────────────────────────────────────────────────
+// Set TEST_SLICE to a number to run only the first N WOIDs (for testing).
+// Set to 0 or Infinity to run ALL WOIDs.
+const TEST_SLICE = 0;   // ← change to 0 to run all 85, or set a number for testing
 
-// ─── Excel helpers ────────────────────────────────────────────────────────────
+// ─── Checkpoint helpers (crash recovery) ──────────────────────────────────────
+// After every WO, results are saved to CHECKPOINT_PATH.
+// On restart the script reads this and skips already-done WOIDs.
+interface CheckpointData {
+  detailRows:  string[][];
+  summaryRows: string[][];
+  fieldsRows:  string[][];
+  doneWoids:   string[];
+}
 
-/** Read WOID (col C) and Worker Name (col D) from the WO sheet, skipping header row */
-async function readWOSheet(): Promise<Array<{ woid: string; name: string }>> {
+function loadCheckpoint(): CheckpointData {
+  try {
+    if (fs.existsSync(CHECKPOINT_PATH)) {
+      const data = JSON.parse(fs.readFileSync(CHECKPOINT_PATH, 'utf8')) as CheckpointData;
+      console.log(`[Checkpoint] Resuming — ${data.doneWoids.length} WOIDs already done`);
+      return data;
+    }
+  } catch { /* corrupted — start fresh */ }
+  return { detailRows: [], summaryRows: [], fieldsRows: [], doneWoids: [] };
+}
+
+function saveCheckpoint(cp: CheckpointData): void {
+  fs.writeFileSync(CHECKPOINT_PATH, JSON.stringify(cp));
+}
+
+function clearCheckpoint(): void {
+  try { if (fs.existsSync(CHECKPOINT_PATH)) fs.unlinkSync(CHECKPOINT_PATH); } catch { /* */ }
+}
+
+// ─── Types ─────────────────────────────────────────────────────────────────────
+interface WORecord {
+  simplify3xId: string;
+  domainId:     string;
+  woid:         string;
+  name:         string;
+  doj:          string;
+  location:     string;
+  email:        string;
+  phone:        string;
+}
+
+interface TimesheetRow {
+  status: string; tsId: string; startDt: string; endDt: string;
+  approved: string; st: string; ot: string; dt: string;
+  others: string; nb: string; amount: string;
+}
+
+interface DayDetail {
+  dayLabel: string; isSat: boolean; isSun: boolean; hours: number;
+}
+
+// ─── Graph / SharePoint ────────────────────────────────────────────────────────
+async function getGraphToken(): Promise<string> {
+  const res = await axios.post(
+    `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
+    new URLSearchParams({ grant_type: 'client_credentials', client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET, scope: 'https://graph.microsoft.com/.default' }).toString(),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+  );
+  return res.data.access_token;
+}
+
+function encodeSharingUrl(url: string): string {
+  const b64 = Buffer.from(url).toString('base64');
+  return 'u!' + b64.replace(/=/g, '').replace(/\//g, '_').replace(/\+/g, '-');
+}
+
+async function downloadFromSharePoint(): Promise<void> {
+  const token = await getGraphToken();
+  try {
+    const res = await axios.get(
+      `https://graph.microsoft.com/v1.0/users/${ONEDRIVE_USER}/drive/items/${ONEDRIVE_ITEM}/content`,
+      { headers: { Authorization: `Bearer ${token}` }, responseType: 'arraybuffer' });
+    fs.writeFileSync(XLSX_PATH, Buffer.from(res.data));
+    console.log(`[Graph] Downloaded ${res.data.byteLength} bytes`); return;
+  } catch (e: any) { console.log(`[Graph] Direct failed (${e?.response?.status ?? e?.message})`); }
+  const res = await axios.get(
+    `https://graph.microsoft.com/v1.0/shares/${encodeSharingUrl(SHARING_URL)}/driveItem/content`,
+    { headers: { Authorization: `Bearer ${token}` }, responseType: 'arraybuffer' });
+  fs.writeFileSync(XLSX_PATH, Buffer.from(res.data));
+  console.log(`[Graph] Downloaded via shares (${res.data.byteLength} bytes)`);
+}
+
+async function uploadToSharePoint(): Promise<void> {
+  const token = await getGraphToken();
+  await axios.put(
+    `https://graph.microsoft.com/v1.0/users/${ONEDRIVE_USER}/drive/items/${ONEDRIVE_ITEM}/content`,
+    fs.readFileSync(XLSX_PATH),
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' } });
+  console.log('[Graph] SharePoint updated ✓');
+}
+
+// ─── Excel: read WO sheet ──────────────────────────────────────────────────────
+// WO sheet columns: 1=Simplify3x ID, 2=Domain ID, 3=WOID, 4=Name,
+//                   5=DOJ, 6=Location, 7=Email, 8=Phone
+async function readWOSheet(): Promise<WORecord[]> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(XLSX_PATH);
   const ws = wb.getWorksheet('WO');
-  if (!ws) throw new Error('WO sheet not found in FieldGlass.xlsx');
-  const items: Array<{ woid: string; name: string }> = [];
-  ws.eachRow({ includeEmpty: false }, (row, rowNum) => {
-    if (rowNum === 1) return; // skip header
-    const woid = String(row.getCell(3).value ?? '').trim(); // column C
-    const name = String(row.getCell(4).value ?? '').trim(); // column D
-    if (woid) items.push({ woid, name });
+  if (!ws) throw new Error('WO sheet not found');
+  const items: WORecord[] = [];
+  ws.eachRow({ includeEmpty: false }, (row, n) => {
+    if (n === 1) return;
+    const woid = String(row.getCell(3).value ?? '').trim();
+    if (!woid) return;
+    items.push({
+      simplify3xId: String(row.getCell(1).value ?? '').trim(),
+      domainId:     String(row.getCell(2).value ?? '').trim(),
+      woid,
+      name:         String(row.getCell(4).value ?? '').trim(),
+      doj:          String(row.getCell(5).value ?? '').trim(),
+      location:     String(row.getCell(6).value ?? '').trim(),
+      email:        String(row.getCell(7).value ?? '').trim(),
+      phone:        String(row.getCell(8).value ?? '').trim(),
+    });
   });
-  console.log(`Read ${items.length} WOIDs from WO sheet`);
   return items;
 }
 
-/** Write all collected rows to the output sheet (clears it first) */
-async function writeOutputSheet(allRows: string[][]) {
+// ─── Excel: write Detail sheet ─────────────────────────────────────────────────
+// Detail sheet: removed DT Hours and Others Hours columns per requirements
+// OT Hours = actual overtime (Sat/Sun>0 or weekday>8)
+// NB Hours = total leave hours (weekday hours that are <8, summed as missing hours)
+const DETAIL_HEADERS = [
+  'WOID', 'Worker Name', 'Timesheet ID', 'Status',
+  'Start Date', 'End Date', 'Approved Date',
+  'ST Hours', 'OT Hours', 'NB Hours', 'Amount (INR)',
+];
+async function writeDetailSheet(rows: string[][]): Promise<void> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(XLSX_PATH);
-
   let ws = wb.getWorksheet(SHEET_NAME);
-  if (!ws) {
-    ws = wb.addWorksheet(SHEET_NAME);
-    console.log(`Created sheet "${SHEET_NAME}"`);
-  } else {
-    ws.spliceRows(1, ws.rowCount);
-    console.log(`Cleared sheet "${SHEET_NAME}"`);
-  }
-
-  // Header row — blue background, white bold text
-  const headerRow = ws.addRow(OUTPUT_HEADERS);
-  headerRow.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0070C0' } };
-  headerRow.font   = { bold: true, color: { argb: 'FFFFFFFF' } };
-  headerRow.alignment = { horizontal: 'center', vertical: 'middle' };
-
-  // Data rows
-  for (const row of allRows) {
-    ws.addRow(row);
-  }
-
-  // Auto-fit column widths
-  ws.columns.forEach(col => {
-    let maxLen = 10;
-    col.eachCell?.({ includeEmpty: false }, cell => {
-      const v = cell.value?.toString() ?? '';
-      if (v.length > maxLen) maxLen = v.length;
-    });
-    col.width = maxLen + 2;
-  });
-
+  if (!ws) { ws = wb.addWorksheet(SHEET_NAME); } else { ws.spliceRows(1, ws.rowCount); }
+  const hdr = ws.addRow(DETAIL_HEADERS);
+  hdr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0070C0' } };
+  hdr.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  hdr.alignment = { horizontal: 'center', vertical: 'middle' };
+  for (const row of rows) ws.addRow(row);
+  ws.columns.forEach(col => { let m = 10; col.eachCell?.({ includeEmpty: false }, c => { const v = c.value?.toString() ?? ''; if (v.length > m) m = v.length; }); col.width = m + 2; });
   await wb.xlsx.writeFile(XLSX_PATH);
-  console.log(`\nSaved ${allRows.length} data rows to "${SHEET_NAME}" in FieldGlass.xlsx`);
+  console.log(`[Excel] Detail: ${rows.length} rows → "${SHEET_NAME}"`);
 }
 
-/**
- * Write raw timesheet rows to the "fields" sheet.
- * The sheet already has the header row: Status | ID | Start | End | Approved | ST | OT | DT | Others | NB | Amount (INR)
- * We keep the header and replace all data rows below it.
- * Each input row = [Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount]
- */
-async function writeFieldsSheet(rows: string[][]) {
+// ─── Excel: write fields sheet ─────────────────────────────────────────────────
+async function writeFieldsSheet(rows: string[][]): Promise<void> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(XLSX_PATH);
-
-  const ws = wb.getWorksheet('fields');
-  if (!ws) throw new Error('"fields" sheet not found in FieldGlass.xlsx');
-
-  // Keep row 1 (header), delete everything after it
-  const totalRows = ws.rowCount;
-  if (totalRows > 1) ws.spliceRows(2, totalRows - 1);
-
-  // Append data rows
-  for (const row of rows) {
-    ws.addRow(row);
-  }
-
-  // Auto-fit column widths
-  ws.columns.forEach(col => {
-    let maxLen = 10;
-    col.eachCell?.({ includeEmpty: false }, cell => {
-      const v = cell.value?.toString() ?? '';
-      if (v.length > maxLen) maxLen = v.length;
-    });
-    col.width = maxLen + 2;
-  });
-
+  const ws = wb.getWorksheet(FIELDS_SHEET);
+  if (!ws) { console.log('[Excel] "fields" sheet not found — skipping'); return; }
+  if (ws.rowCount > 1) ws.spliceRows(2, ws.rowCount - 1);
+  for (const row of rows) ws.addRow(row);
+  ws.columns.forEach(col => { let m = 10; col.eachCell?.({ includeEmpty: false }, c => { const v = c.value?.toString() ?? ''; if (v.length > m) m = v.length; }); col.width = m + 2; });
   await wb.xlsx.writeFile(XLSX_PATH);
-  console.log(`\nSaved ${rows.length} rows to "fields" sheet in FieldGlass.xlsx`);
+  console.log(`[Excel] Fields: ${rows.length} rows`);
 }
 
-// ─── Page helpers ─────────────────────────────────────────────────────────────
+// ─── Excel: write Summary sheet (exact Image 1 columns) ───────────────────────
+// Cols: Simplify3x ID | Domain ID | WOID | Name | Total Hrs | Timesheet status | TS Hrs | Leaves | Overtime
+// Leaves   → written when total TS Hrs < 200 (under-hours) — weekday dates where hours = 0
+// Overtime → written when total TS Hrs > 200 (over-hours) — dates where ST > 40 per week
+const SUMMARY_HEADERS = [
+  'Simplify3x ID', 'Domain ID', 'WOID', 'Name',
+  'Total Hrs', 'Timesheet status', 'TS Hrs', 'NB', 'Overtime',
+];
+const MONTHLY_ST_THRESHOLD = 200; // monthly standard hours threshold
+async function writeSummarySheet(rows: string[][]): Promise<void> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(XLSX_PATH);
+  let ws = wb.getWorksheet(SUMMARY_SHEET);
+  if (!ws) { ws = wb.addWorksheet(SUMMARY_SHEET); } else { ws.spliceRows(1, ws.rowCount); }
+  const hdr = ws.addRow(SUMMARY_HEADERS);
+  hdr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF203864' } };
+  hdr.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  hdr.alignment = { horizontal: 'center', vertical: 'middle' };
+  for (const row of rows) {
+    const dataRow = ws.addRow(row);
+    // Yellow highlight when TS Hrs ≠ 40
+    const tsHrs = parseFloat(row[10] ?? '');
+    if (!isNaN(tsHrs) && tsHrs !== SAP_EXPECTED_ST) {
+      dataRow.eachCell({ includeEmpty: false }, cell => {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF2CC' } };
+      });
+    }
+  }
+  ws.columns.forEach(col => { let m = 10; col.eachCell?.({ includeEmpty: false }, c => { const v = c.value?.toString() ?? ''; if (v.length > m) m = v.length; }); col.width = m + 2; });
+  await wb.xlsx.writeFile(XLSX_PATH);
+  console.log(`[Excel] Summary: ${rows.length} rows → "${SUMMARY_SHEET}"`);
+}
 
-async function waitForSettle(page: Page, ms = 3000) {
+// ─── Browser helpers ───────────────────────────────────────────────────────────
+async function settle(page: Page, ms = 3000) {
   await page.waitForLoadState('load').catch(() => {});
-  await page.waitForTimeout(ms);
+  await page.waitForTimeout(ms).catch(() => {});
 }
 
 async function acceptCookies(page: Page) {
-  const selectors = [
-    'button:has-text("Accept All")',
-    'button:has-text("Accept all")',
-    'button:has-text("Accept Cookies")',
-    '#onetrust-accept-btn-handler',
-  ];
-  for (const sel of selectors) {
-    try {
-      const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 3000 })) {
-        await btn.click();
-        console.log(`Cookies accepted via: ${sel}`);
-        await page.waitForTimeout(1500);
-        return;
-      }
-    } catch { /* skip */ }
+  for (const sel of ['button:has-text("Accept All")', 'button:has-text("Accept all")', '#onetrust-accept-btn-handler']) {
+    try { const b = page.locator(sel).first(); if (await b.isVisible({ timeout: 3000 })) { await b.click(); await page.waitForTimeout(1500); return; } } catch { /* */ }
   }
 }
 
 async function dismissPanel(page: Page) {
-  const selectors = [
-    'button[aria-label="Close"]', 'button[title="Close"]',
-    'button:has-text("×")', 'button:has-text("✕")',
-    'button.close', 'button[class*="closeBtn"]',
-  ];
-  for (const sel of selectors) {
-    try {
-      const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 1500 })) {
-        await btn.click();
-        await page.waitForTimeout(600);
-        return;
-      }
-    } catch { /* skip */ }
+  for (const sel of ['button[aria-label="Close"]', 'button[title="Close"]', 'button.close', 'button:has-text("×")']) {
+    try { const b = page.locator(sel).first(); if (await b.isVisible({ timeout: 1500 })) { await b.click(); await page.waitForTimeout(600); return; } } catch { /* */ }
   }
   await page.keyboard.press('Escape').catch(() => {});
-  await page.waitForTimeout(400);
+  await page.waitForTimeout(400).catch(() => {});
 }
 
-async function getActivePage(
-  context: import('@playwright/test').BrowserContext,
-  fallback: Page
-): Promise<Page> {
-  const pages = context.pages();
-  for (const p of pages) {
-    try {
-      const url = p.url();
-      if (!url.includes('login.do') && url !== 'about:blank') {
-        await p.waitForLoadState('domcontentloaded').catch(() => {});
-        return p;
-      }
-    } catch { /* closed */ }
-  }
-  for (const p of pages) {
-    try { p.url(); return p; } catch { /* closed */ }
-  }
-  return fallback;
+// Tab guard: disabled — do NOT close any tabs.
+// SAP opens a new tab on login; we keep all tabs open and just track the active one.
+function registerTabGuard(_ctx: BrowserContext): (p: Page) => void {
+  const handler = (_newPage: Page) => { /* no-op — do not close any tab */ };
+  return handler;
 }
 
-// ─── Text parser ──────────────────────────────────────────────────────────────
+// ─── Login ─────────────────────────────────────────────────────────────────────
+async function doLogin(page: Page, ctx: BrowserContext): Promise<Page> {
+  console.log('[Login] → SAP Fieldglass...');
+  await page.goto('https://www.us.fieldglass.cloud.sap/login.do');
+  await page.waitForLoadState('domcontentloaded');
+  await acceptCookies(page);
+  await dismissPanel(page);
+  await page.waitForTimeout(2000);
 
-/**
- * Parse the Time Sheets section from the page's body innerText.
- * Returns raw data rows (11 cells each: Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount).
- */
-function parseTimeSheetsFromText(rawText: string): string[][] {
+  const user = page.locator('input[name="username"], input[id="username"], input[type="text"]').first();
+  await user.waitFor({ state: 'visible', timeout: 15000 });
+  await user.fill('Chethan K');
+  const pass = page.locator('input[type="password"]').first();
+  await pass.waitFor({ state: 'visible', timeout: 10000 });
+  await pass.fill('AmmuCA@@2002');
+
+  const newTabP = ctx.waitForEvent('page', { timeout: 40000 }).catch(() => null);
+  const btn = page.locator('button:has-text("Sign In"), button[type="submit"], input[type="submit"]').first();
+  await btn.waitFor({ state: 'visible', timeout: 10000 });
+  await btn.click();
+  console.log('[Login] Sign In clicked');
+
+  const newTab = await newTabP;
+  let ap: Page;
+  if (newTab) {
+    await newTab.waitForLoadState('domcontentloaded').catch(() => {});
+    // Do NOT close original tab — keep existing Chrome browser open
+    ap = newTab;
+  } else {
+    ap = page;
+  }
+
+  // Wait until we land on a non-login page, always using the LATEST active page
+  // SAP may open additional redirect tabs — pick whichever page is not login.do
+  for (let i = 0; i < 30; i++) {
+    // Always re-fetch the most recently active page from context
+    const pages = ctx.pages();
+    const active = pages.find(p => {
+      try { const u = p.url(); return u && !u.includes('login.do') && u !== 'about:blank'; }
+      catch { return false; }
+    });
+    if (active) { ap = active; break; }
+    await new Promise(r => setTimeout(r, 2000));
+    if (i === 29) throw new Error('[Login] Timeout — still on login.do after 60s');
+  }
+
+  await settle(ap, 5000).catch(() => {});
+  console.log(`[Login] OK → ${ap.url()}`);
+  await dismissPanel(ap).catch(() => {});
+  await ap.waitForTimeout(3000).catch(() => {});
+  return ap;
+}
+
+// ─── Timesheet list parser ─────────────────────────────────────────────────────
+function parseTimesheets(rawText: string): TimesheetRow[] {
   const STATUS_PREFIXES = ['Invoiced', 'Draft', 'Pending', 'Rejected', 'Submitted', 'Recalled'];
   const isStatus = (l: string) => STATUS_PREFIXES.some(p => l === p || l.startsWith(p + ' '));
-  const COL_COUNT = 11; // Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount
-
-  // Step 1: merge "DD/MM/YYYY" + "HH:MM AM/PM" pairs split across 2 lines
-  const rawLines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const isDate   = (l: string) => /^\d{2}\/\d{2}\/\d{4}/.test(l);
+  const isNum    = (l: string) => /^-?[\d,]+(\.\d+)?$/.test(l);
+  const COL      = 11;
+  const raw = rawText.split('\n').map(l => l.trim()).filter(Boolean);
   const lines: string[] = [];
-  for (let i = 0; i < rawLines.length; i++) {
-    const cur = rawLines[i];
-    const nxt = rawLines[i + 1] ?? '';
-    if (/^\d{2}\/\d{2}\/\d{4}$/.test(cur) && /^\d{2}:\d{2}\s+(AM|PM)$/.test(nxt)) {
-      lines.push(`${cur} ${nxt}`);
-      i++;
-    } else {
-      lines.push(cur);
-    }
+  for (let i = 0; i < raw.length; i++) {
+    const cur = raw[i], nxt = raw[i + 1] ?? '';
+    if (/^\d{2}\/\d{2}\/\d{4}$/.test(cur) && /^\d{2}:\d{2}\s+(AM|PM)$/.test(nxt)) { lines.push(`${cur} ${nxt}`); i++; }
+    else lines.push(cur);
   }
-
-  // Step 2: find "Time Sheets" section heading
   const tsIdx = lines.findIndex(l => l === 'Time Sheets');
   if (tsIdx === -1) return [];
-
-  // Step 3: find "Status" column header after the heading
-  let headerIdx = -1;
-  for (let i = tsIdx; i < Math.min(tsIdx + 25, lines.length); i++) {
-    if (lines[i] === 'Status') { headerIdx = i; break; }
-  }
-  if (headerIdx === -1) return [];
-
-  // Step 4: skip the 11 column header lines, then skip any "All" filter pill
-  let dataStart = headerIdx + COL_COUNT;
-  if (lines[dataStart] === 'All') dataStart++;
-
-  // Helper: true if a line is a section boundary / sort indicator
-  const isBoundary = (l: string) =>
-    l.startsWith('Clear Sort') || l.startsWith('Clear Filters') ||
-    l.startsWith('No items') || l.startsWith('Press enter') ||
-    /^\d+-\d+ of \d+/.test(l) ||
+  let hdrIdx = -1;
+  for (let i = tsIdx; i < Math.min(tsIdx + 25, lines.length); i++) { if (lines[i] === 'Status') { hdrIdx = i; break; } }
+  if (hdrIdx === -1) return [];
+  let ds = hdrIdx + COL;
+  if (lines[ds] === 'All') ds++;
+  const isBnd = (l: string) =>
+    l.startsWith('Clear Sort') || l.startsWith('Clear Filters') || l.startsWith('No items') ||
+    l.startsWith('Press enter') || /^\d+-\d+ of \d+/.test(l) ||
     l === 'Absences' || l === 'Expense Sheets' || l === 'Credit/Debit Memo';
-
-  // Helper: true if a line looks like a timesheet ID (LHTLTS...)
-  const isTimesheetId = (l: string) => /^[A-Z]{3,}TS\d+$/.test(l);
-
-  // Helper: true if a line looks like a date (DD/MM/YYYY or DD/MM/YYYY HH:MM AM/PM)
-  const isDate = (l: string) => /^\d{2}\/\d{2}\/\d{4}/.test(l);
-
-  // Helper: true if a line is a plain number (ST/OT/DT/Others/NB hours or amount)
-  const isNumber = (l: string) => /^-?[\d,]+(\.\d+)?$/.test(l);
-
-  // Step 5: collect rows — each starts with a status word
-  // For Pending/Draft rows the Approved field may be empty, so we detect row
-  // boundaries by looking for the NEXT status word or boundary, not fixed column count.
-  const rows: string[][] = [];
-  let i = dataStart;
-
+  const rows: TimesheetRow[] = [];
+  let i = ds;
   while (i < lines.length) {
     const line = lines[i];
-
-    if (isBoundary(line)) break;
-
+    if (isBnd(line)) break;
     if (isStatus(line)) {
-      // We know the row structure: Status | ID | Start | End | Approved | ST | OT | DT | Others | NB | Amount
-      // Approved is a datetime for Invoiced, but empty for Pending/Draft (not yet approved)
-      // Collect up to COL_COUNT cells, stopping early if we hit the next status word or boundary
-      const row: string[] = [line]; // [0] Status
+      const c: string[] = [line];
       let j = i + 1;
-
-      // [1] Timesheet ID
-      if (j < lines.length && !isStatus(lines[j]) && !isBoundary(lines[j]))
-        row.push(lines[j++]);
-      else row.push('');
-
-      // [2] Start date
-      if (j < lines.length && isDate(lines[j]))
-        row.push(lines[j++]);
-      else row.push('');
-
-      // [3] End date
-      if (j < lines.length && isDate(lines[j]))
-        row.push(lines[j++]);
-      else row.push('');
-
-      // [4] Approved date — only present if row is Invoiced/has approval datetime
-      if (j < lines.length && isDate(lines[j]))
-        row.push(lines[j++]);
-      else row.push(''); // Pending/Draft: no approval date
-
-      // [5-10] ST, OT, DT, Others, NB, Amount — numeric fields
-      for (let k = 5; k < COL_COUNT; k++) {
-        if (j < lines.length && isNumber(lines[j]) && !isStatus(lines[j]) && !isBoundary(lines[j]))
-          row.push(lines[j++]);
-        else row.push('');
-      }
-
-      rows.push(row);
-      i = j; // advance past consumed cells
-    } else {
-      i++;
-    }
+      if (j < lines.length && !isStatus(lines[j]) && !isBnd(lines[j])) c.push(lines[j++]); else c.push('');
+      for (let k = 0; k < 3; k++) { if (j < lines.length && isDate(lines[j])) c.push(lines[j++]); else c.push(''); }
+      for (let k = 5; k < COL; k++) { if (j < lines.length && isNum(lines[j]) && !isStatus(lines[j]) && !isBnd(lines[j])) c.push(lines[j++]); else c.push(''); }
+      rows.push({ status: c[0], tsId: c[1], startDt: c[2], endDt: c[3], approved: c[4], st: c[5], ot: c[6], dt: c[7], others: c[8], nb: c[9], amount: c[10] });
+      i = j;
+    } else { i++; }
   }
   return rows;
 }
 
-// ─── Per-WO fetch helper ──────────────────────────────────────────────────────
+// ─── Time Worked parser (inside a TS detail page) ─────────────────────────────
+// SAP innerText format (confirmed from debug):
+//   Each row is ONE line with tab-separated values:
+//   "Day\t25/7"  "Sat\t26/7"  "Sun\t27/7"  "Mon\t28/7" ...
+//   "Total\t0.00\t0.00\t8.00\t8.00\t8.00\t8.00\t8.00\t40.00"
+//
+// Strategy:
+//   1. Find consecutive lines matching "DayName\tDate" pattern (Sat\t18/7 etc.)
+//      These are the column headers.
+//   2. Find the "Total\t..." line after them — split by tab to get per-day hours.
+//   3. The last "Total" line before the next section = grand total.
+function parseTimeWorked(rawText: string): DayDetail[] {
+  const lines   = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+  const isN     = (s: string) => /^-?\d+(\.\d+)?$/.test(s);
+  const isDate  = (s: string) => /^\d{1,2}\/\d{1,2}$/.test(s);
+  const isDayNm = (s: string) => /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/i.test(s);
 
-/**
- * For a given page (already on the SAP dashboard), search for woid,
- * navigate to Time & Expense, apply the date filter, and return extracted rows.
- * Returns [] if no timesheets found for this WO.
- */
-async function fetchTimesheetsForWO(
-  ap: Page,
-  woid: string,
-  context: import('@playwright/test').BrowserContext
-): Promise<{ rows: string[][]; page: Page }> {
-  console.log(`\n--- Fetching: ${woid} ---`);
+  // ── Step 1: Find the column header block ─────────────────────────────────────
+  // Confirmed SAP innerText format (from debug):
+  //   Line N  :  "Day\t25/7"   ← row-label="Day",  col-1 date=25/7 (no day name yet)
+  //   Line N+1:  "Sat\t26/7"   ← day name "Sat" belongs to col-1 (25/7), col-2 date=26/7
+  //   Line N+2:  "Sun\t27/7"   ← day name "Sun" belongs to col-2 (26/7), col-3 date=27/7
+  //   ...
+  //   Line N+7:  "Fri\tTotal Worked" ← day name "Fri" belongs to col-7, last column
+  //
+  // So: dayName[k] is on line[k+1].split('\t')[0], and date[k] is on line[k].split('\t')[1]
+  let dayLabels: DayDetail[] = [];
+  let headerEndIdx = -1;
 
-  // Re-resolve the active page — SAP may have opened a new tab during the previous WO
-  try {
-    const url = ap.url();
-    if (!url || url === 'about:blank') ap = await getActivePage(context, ap);
-  } catch {
-    ap = await getActivePage(context, ap);
-  }
+  for (let i = 0; i < lines.length - 4; i++) {
+    const firstParts = lines[i].split('\t');
+    // Start of header block: first token is "Day" or a day-name, second token is a date
+    if (firstParts.length < 2 || !isDate(firstParts[1])) continue;
 
-  // Search
-  const searchField = ap.locator(
-    'input[placeholder*="Search by ID"], input[placeholder*="Search"], input[type="search"]'
-  ).first();
-  await searchField.waitFor({ state: 'visible', timeout: 20000 });
-  await searchField.fill(woid);
-  await searchField.press('Enter');
-  await waitForSettle(ap, 3000);
+    // Collect dates from this block (date is secondToken of each line)
+    const dates: string[] = [];
+    let j = i;
+    while (j < lines.length && dates.length < 7) {
+      const p = lines[j].split('\t');
+      if (p.length < 2 || !isDate(p[1])) break;
+      dates.push(p[1]);
+      j++;
+    }
+    if (dates.length < 5) continue;
 
-  // If search landed on Global Search page (global_search.do), click "Go to Details"
-  if (ap.url().includes('global_search.do')) {
-    console.log(`  Global Search page detected — clicking "Go to Details"`);
-    const goToDetails = ap.locator('a:has-text("Go to Details"), a[href*="work_order_detail"]').first();
-    try {
-      await goToDetails.waitFor({ state: 'visible', timeout: 10000 });
-      await goToDetails.click();
-      await waitForSettle(ap, 3000);
-    } catch {
-      console.log(`  Could not find "Go to Details" for ${woid} — skipping`);
-      return { rows: [], page: ap };
+    // Now collect day-names: dayName[k] = firstToken of line[i+k+1]
+    // (offset by 1: line i+1 has "Sat" for date at line i's second token, etc.)
+    const candidate: DayDetail[] = [];
+    for (let k = 0; k < dates.length; k++) {
+      const dnLine = lines[i + k + 1] ?? '';
+      const dnParts = dnLine.split('\t').map(p => p.trim()); // trim \r and whitespace
+      const dn = isDayNm(dnParts[0]) ? dnParts[0] : '?';
+      candidate.push({
+        dayLabel: `${dn} ${dates[k]}`,
+        isSat:    dn.toLowerCase() === 'sat',
+        isSun:    dn.toLowerCase() === 'sun',
+        hours:    0,
+      });
+    }
+    if (candidate.length >= 5) {
+      dayLabels    = candidate;
+      headerEndIdx = j;
+      break;
     }
   }
 
-  // Click Time & Expense tab
-  const teTab = ap.locator('a[href*="tabId=timeAndExpense"], a:has-text("Time & Expense")').first();
-  try {
-    await teTab.waitFor({ state: 'visible', timeout: 15000 });
-  } catch {
-    console.log(`  No Time & Expense tab found for ${woid} — skipping`);
-    return { rows: [], page: ap };
-  }
-  await teTab.click();
-  await waitForSettle(ap, 3000);
+  if (!dayLabels.length) return [];
+  const N = dayLabels.length;
 
-  // Fill date range — from
-  const dateInputs = ap.locator('input[aria-label="Open Calendar (DD/MM/YYYY)"]');
-  try {
-    await dateInputs.first().waitFor({ state: 'visible', timeout: 12000 });
-  } catch {
-    console.log(`  No date inputs found for ${woid} — skipping`);
-    return { rows: [], page: ap };
+  // ── Step 2: Find "Total\tV1\tV2\t..." line — keep the LAST one ───────────────
+  // This is the grand-total row at the bottom of the Time Worked table.
+  let bestVals: number[] | null = null;
+  for (let i = headerEndIdx; i < Math.min(headerEndIdx + 150, lines.length); i++) {
+    const p = lines[i].split('\t');
+    if (p[0] === 'Total' && p.length >= N + 1) {
+      const vals = p.slice(1, N + 1).map(v => parseFloat(v) || 0);
+      if (vals.length === N) bestVals = vals; // keep overwriting → last one wins
+    }
   }
 
-  await dateInputs.nth(0).click({ clickCount: 3 });
-  await dateInputs.nth(0).fill(FROM_DATE);
-  await ap.keyboard.press('Tab');
-  await ap.waitForTimeout(600);
+  if (bestVals) {
+    for (let m = 0; m < N; m++) dayLabels[m].hours = bestVals[m];
+    return dayLabels;
+  }
 
-  // Fill date range — to
-  await dateInputs.nth(1).click({ clickCount: 3 });
-  await dateInputs.nth(1).fill(TO_DATE);
-  await ap.keyboard.press('Tab'); // Tab moves focus to Apply Filters button
-  await ap.waitForTimeout(600);
+  // ── Fallback: sum all "Time Worked\tV1\tV2\t..." lines ───────────────────────
+  for (let i = headerEndIdx; i < Math.min(headerEndIdx + 150, lines.length); i++) {
+    const p = lines[i].split('\t');
+    if (p[0] === 'Time Worked' && p.length >= N + 1) {
+      const vals = p.slice(1, N + 1).map(v => parseFloat(v) || 0);
+      if (vals.length === N) {
+        for (let m = 0; m < N; m++) dayLabels[m].hours += vals[m];
+      }
+    }
+  }
 
-  // Apply Filters — button has focus after Tab, press Enter to activate
-  await ap.keyboard.press('Enter');
-  await waitForSettle(ap, 3000);
-
-  // Extract data
-  const rawText = await ap.evaluate(() => document.body.innerText);
-  const rows = parseTimeSheetsFromText(rawText);
-  console.log(`  Found ${rows.length} timesheet rows`);
-  return { rows, page: ap };
+  return dayLabels;
 }
 
-// ─── Main test ────────────────────────────────────────────────────────────────
+// ─── Drill into one TS ID — return leave days + weekend work ──────────────────
+interface DrillResult {
+  leaveDates:  string;  // dates of weekday absences e.g. "Mon 7/7, Tue 14/7"
+  nbCount:     number;  // count of absent weekdays
+  weekendWork: string;  // weekend hours e.g. "Sat 4/7(8h)"
+  otHours:     number;  // total weekend hours worked
+}
 
-test('Hr Time Sheet Format — All WOs', async ({ page, context }) => {
+async function drillIntoTS(ap: Page, tsId: string): Promise<DrillResult> {
+  console.log(`   → drill TS: ${tsId}`);
 
-  // ── Read WOIDs from WO sheet ─────────────────────────────────────────────────
-  // To run for ALL WOIDs: remove the .slice(0, 1) below
-  // const woList = (await readWOSheet()).slice(0, 5);
-  const woList = await readWOSheet(); // ← uncomment this (and comment line above) to run all
-  expect(woList.length).toBeGreaterThan(0);
-  console.log(`Processing ${woList.length} WOID(s):`, woList.map(w => w.woid).join(', '));
+  // Save T&E URL BEFORE clicking — SAP's T&E page loads via POST.
+  // goBack() causes ERR_CACHE_MISS; navigate directly back to saved URL.
+  const teUrl = ap.url();
 
-  // ── Login ────────────────────────────────────────────────────────────────────
-  await page.goto('https://www.us.fieldglass.cloud.sap/login.do');
-  await page.waitForLoadState('domcontentloaded');
-  await expect(page).toHaveURL(/login\.do/);
-  console.log('On login page');
-
-  await acceptCookies(page);
-  await dismissPanel(page);
-
-  // Username
-  const usernameField = page.locator(
-    'input[name="username"], input[id="username"], input[type="text"]'
+  // SAP renders TS IDs as links inside table cells — try multiple locator strategies
+  const link = ap.locator(
+    `a:has-text("${tsId}"), a[href*="${tsId}"], td:has-text("${tsId}") a, [data-id="${tsId}"] a`
   ).first();
-  await usernameField.waitFor({ state: 'visible', timeout: 15000 });
-  await usernameField.fill('Chethan K');
-  await expect(usernameField).toHaveValue('Chethan K');
-
-  // Password
-  const passwordField = page.locator('input[type="password"]').first();
-  await passwordField.waitFor({ state: 'visible', timeout: 10000 });
-  await passwordField.fill('AmmuCA@@2002');
-
-  // Sign In
-  const newTabPromise = context.waitForEvent('page', { timeout: 30000 }).catch(() => null);
-  const signInBtn = page.locator(
-    'button:has-text("Sign In"), button[type="submit"], input[type="submit"]'
-  ).first();
-  await signInBtn.waitFor({ state: 'visible', timeout: 10000 });
-  await signInBtn.click();
-  console.log('Sign In clicked');
-
-  // Resolve active page (SAP may open a new tab and close original)
-  const newTab = await newTabPromise;
-  let ap: Page;
-  if (newTab) {
-    await newTab.waitForLoadState('domcontentloaded').catch(() => {});
-    ap = newTab;
-    console.log('Switched to new tab');
-  } else {
-    ap = await getActivePage(context, page);
-  }
-
-  // Wait until URL is off login.do (handles login.do# SSO phase)
-  for (let i = 0; i < 30; i++) {
-    await ap.waitForTimeout(2000).catch(async () => { ap = await getActivePage(context, page); });
-    let url = '';
-    try { url = ap.url(); } catch { ap = await getActivePage(context, page); url = ap.url(); }
-    console.log(`  [${i + 1}] ${url}`);
-    if (url && !url.includes('login.do')) break;
-    if (i === 29) throw new Error('Login failed — still on login.do after 60s');
-  }
-
-  await waitForSettle(ap, 2000);
-  console.log('Login OK:', ap.url());
-  await dismissPanel(ap);
-
-  // ── Loop through all WOs ─────────────────────────────────────────────────────
-  const allOutputRows: string[][] = [];
-
-  for (const { woid, name } of woList) {
-    let rows: string[][] = [];
+  try {
+    await link.waitFor({ state: 'visible', timeout: 10000 });
+    await link.click();
+    await settle(ap, 4000);
+  } catch {
+    // Final fallback: find any link on the page whose text exactly matches the tsId
     try {
-      const result = await fetchTimesheetsForWO(ap, woid, context);
-      rows = result.rows;
-      ap = result.page; // keep ap up-to-date in case SAP switched tabs
-    } catch (err) {
-      console.log(`  ERROR fetching ${woid}: ${err}`);
-      // Try to recover the active page before continuing to the next WO
-      try { ap = await getActivePage(context, ap); } catch { /* ignore */ }
+      const fallback = ap.getByText(tsId, { exact: true }).first();
+      await fallback.waitFor({ state: 'visible', timeout: 5000 });
+      await fallback.click();
+      await settle(ap, 4000);
+    } catch {
+      console.log(`   TS link not found: ${tsId}`);
+      return { leaveDates: '', nbCount: 0, weekendWork: '', otHours: 0 };
     }
+  }
 
-    if (rows.length === 0) {
-      // Record a single "no data" row so we know it was checked
-      allOutputRows.push([woid, name, '', 'No Data', '', '', '', '', '', '', '', '', '']);
+  const rawText = await ap.evaluate(() => document.body.innerText);
+  const days = parseTimeWorked(rawText);
+
+  // Rules from image:
+  //   Sat/Sun > 0            → OT (user worked on weekend)
+  //   Mon-Fri > 8            → OT (extra hours on weekday)
+  //   Mon-Fri < 8 (incl. 0) → Leave (user was absent or left early)
+  //   Mon-Fri = 8            → Normal day
+  const otList:    string[] = [];  // OT date+hours labels
+  let totalOtHours  = 0;           // sum of all OT hours
+  const leaveList:  string[] = [];  // Leave date+hours labels
+  let totalLeaveHrs = 0;           // sum of missing hours (8 - actual)
+
+  for (const d of days) {
+    if (d.isSat || d.isSun) {
+      // Weekend: any hours > 0 = OT
+      if (d.hours > 0) {
+        otList.push(`${d.dayLabel}(${d.hours}h)`);
+        totalOtHours += d.hours;
+      }
     } else {
-      // Prepend WOID and Worker Name to each timesheet row
-      // Raw row = [Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount]
-      for (const row of rows) {
-        const [status, tsId, start, end, approved, st, ot, dt, others, nb, amount] = row;
-        allOutputRows.push([
-          woid, name, tsId, status,
-          start, end, approved,
-          st, ot, dt, others, nb, amount,
-        ]);
+      // Weekday: normal = 8h
+      if (d.hours > 8) {
+        // Worked extra — e.g. 10h means 2h OT
+        const extra = d.hours - 8;
+        otList.push(`${d.dayLabel}(+${extra}h)`);
+        totalOtHours += extra;
+      } else if (d.hours < 8) {
+        // Worked less than 8 (or 0) — leave
+        const missing = 8 - d.hours;
+        leaveList.push(`${d.dayLabel}(${d.hours}h)`);
+        totalLeaveHrs += missing;
+      }
+    }
+  }
+
+  console.log(`   OT:[${otList.join(',')}]  Leave:[${leaveList.join(',')}]`);
+
+  // Navigate back to desktop (dashboard) so the next WO search finds the global search box.
+  // Going back to teUrl (T&E POST page) leaves a hidden autocomplete as the first search match.
+  await ap.goto('https://www.us.fieldglass.cloud.sap/desktop.do').catch(() => {});
+  await settle(ap, 3000);
+
+  return {
+    leaveDates:   leaveList.join(', '),
+    nbCount:      totalLeaveHrs,   // total missing hours (not count of days)
+    weekendWork:  otList.join(', '),
+    otHours:      totalOtHours,
+  };
+}
+
+// ─── Fetch one WO ──────────────────────────────────────────────────────────────
+interface FetchResult { detailRows: string[][]; summaryRow: string[]; fieldsRows: string[][]; }
+
+function emptyResult(wo: WORecord): FetchResult {
+  return {
+    detailRows: [[wo.woid, wo.name, '', 'No Data', '', '', '', '', '', '', '', '', '']],
+    // 9 cols matching SUMMARY_HEADERS: Simplify3x ID | Domain ID | WOID | Name | Total Hrs | TS status | TS Hrs | Leaves | Overtime
+    summaryRow: [wo.simplify3xId, wo.domainId, wo.woid, wo.name, '0', 'No Data', '0', '', ''],
+    fieldsRows: [],
+  };
+}
+
+async function fetchWO(ap: Page, wo: WORecord): Promise<{ result: FetchResult; page: Page }> {
+  console.log(`\n[WO] ${wo.woid} — ${wo.name}`);
+
+  // Search
+  const search = ap.locator('input[placeholder*="Search by ID"], input[placeholder*="Search"], input[type="search"]').first();
+  await search.waitFor({ state: 'visible', timeout: 25000 });
+  await ap.waitForTimeout(500);
+  await search.fill(wo.woid);
+  await ap.waitForTimeout(500);
+  await search.press('Enter');
+  await settle(ap, 4000);
+
+  // Global search → Go to Details
+  if (ap.url().includes('global_search.do')) {
+    const link = ap.locator('a:has-text("Go to Details"), a[href*="work_order_detail"]').first();
+    try { await link.waitFor({ state: 'visible', timeout: 12000 }); await link.click(); await settle(ap, 4000); }
+    catch { console.log(`  no details link`); return { result: emptyResult(wo), page: ap }; }
+  }
+
+  // Time & Expense tab
+  const teTab = ap.locator('a[href*="tabId=timeAndExpense"], a:has-text("Time & Expense")').first();
+  try { await teTab.waitFor({ state: 'visible', timeout: 18000 }); }
+  catch { console.log(`  no T&E tab`); return { result: emptyResult(wo), page: ap }; }
+  await teTab.click();
+  await settle(ap, 4000);
+
+  // Date filter
+  const dates = ap.locator('input[aria-label="Open Calendar (DD/MM/YYYY)"]');
+  try { await dates.first().waitFor({ state: 'visible', timeout: 15000 }); }
+  catch { console.log(`  no date inputs`); return { result: emptyResult(wo), page: ap }; }
+  await dates.nth(0).click({ clickCount: 3 }); await dates.nth(0).fill(FROM_DATE); await ap.keyboard.press('Tab'); await ap.waitForTimeout(1000);
+  await dates.nth(1).click({ clickCount: 3 }); await dates.nth(1).fill(TO_DATE);   await ap.keyboard.press('Tab'); await ap.waitForTimeout(1000);
+  await ap.keyboard.press('Enter');
+  await settle(ap, 5000);
+
+  const timesheets = parseTimesheets(await ap.evaluate(() => document.body.innerText));
+  console.log(`  ${timesheets.length} timesheets`);
+  if (!timesheets.length) return { result: emptyResult(wo), page: ap };
+
+  // Detail rows: 10 cols — WOID | Name | TS ID | Status | Start | End | Approved | ST | OT | NB | Amount
+  // (DT and Others columns removed per requirements)
+  const detailRows = timesheets.map(ts => [
+    wo.woid, wo.name, ts.tsId, ts.status,
+    ts.startDt, ts.endDt, ts.approved,
+    ts.st,    // ST Hours
+    ts.ot,    // OT Hours — will be overwritten by drill data below
+    ts.nb,    // NB Hours — will be overwritten by drill data below
+    ts.amount,
+  ]);
+
+  // Fields sheet: Status | ID | Start | End | Approved | ST | OT | NB | Amount (no DT/Others)
+  // Build as same-indexed array as timesheets so drill-in can update OT/NB by index
+  const fieldsRows = timesheets.map(ts => [
+    ts.status, ts.tsId, ts.startDt, ts.endDt, ts.approved,
+    ts.st, // ST
+    ts.ot, // OT — overwritten by drill data below (index 6)
+    ts.nb, // NB — overwritten by drill data below (index 7)
+    ts.amount,
+  ]);
+
+  const totalST  = timesheets.reduce((s, ts) => s + (parseFloat(ts.st) || 0), 0);
+  const statuses = [...new Set(timesheets.map(ts => ts.status))].join(', ');
+
+  // ── Drill into each TS where ST ≠ 40 ──────────────────────────────────────
+  // Rules (confirmed from image):
+  //   Sat/Sun > 0          → OT (weekend overtime)
+  //   Mon-Fri > 8          → OT (extra weekday hours)
+  //   Mon-Fri < 8 (incl 0) → Leave (absent or left early)
+  //   Mon-Fri = 8          → Normal day
+  // OT column in detail sheet  → total OT hours from drill
+  // NB column in detail sheet  → total leave hours from drill (sum of missing hours)
+  // Overtime col in Summary    → OT date+hour labels (always written when found)
+  // NB col in Summary          → Leave date+hour labels (always written when found)
+  const allLeaveDates: string[] = [];
+  const allOtDates:    string[] = [];
+
+  for (let tsIdx = 0; tsIdx < timesheets.length; tsIdx++) {
+    const ts = timesheets[tsIdx];
+    const st = parseFloat(ts.st) || 0;
+    // Drill only when ST ≠ 40
+    if (!ts.tsId || st === SAP_EXPECTED_ST) continue;
+
+    const d = await drillIntoTS(ap, ts.tsId);
+
+    // Collect for Summary columns
+    if (d.weekendWork) allOtDates.push(d.weekendWork);   // OT dates (Sat/Sun + weekday extra)
+    if (d.leaveDates)  allLeaveDates.push(d.leaveDates); // Leave dates (weekday < 8)
+
+    // Write OT hours to detail OT (index 8) and fields OT (index 6)
+    if (d.otHours > 0) { detailRows[tsIdx][8] = String(d.otHours); fieldsRows[tsIdx][6] = String(d.otHours); }
+    // Write leave hours to detail NB (index 9) and fields NB (index 7)
+    if (d.nbCount > 0) { detailRows[tsIdx][9] = String(d.nbCount); fieldsRows[tsIdx][7] = String(d.nbCount); }
+  }
+
+  // ── Summary sheet: always write whatever was found ─────────────────────────
+  const leavesValue   = allLeaveDates.join(', ');
+  const overtimeValue = allOtDates.join(', ');
+
+  // Summary row columns:
+  // Simplify3x ID | Domain ID | WOID | Name |
+  // Total Hrs | Timesheet status | TS Hrs | Leaves | Overtime
+  const summaryRow = [
+    wo.simplify3xId, wo.domainId, wo.woid, wo.name,
+    String(totalST),   // Total Hrs
+    statuses,          // Timesheet status
+    String(totalST),   // TS Hrs
+    leavesValue,       // Leaves — weekday dates with 0 hours (only when total < 200)
+    overtimeValue,     // Overtime — OT dates (only when total > 200)
+  ];
+
+  return { result: { detailRows, summaryRow, fieldsRows }, page: ap };
+}
+
+// ─── Main test — single session, crash-safe checkpoint resume ─────────────────
+test('HR Timesheet — All WOs (single session, crash-safe)', async ({ page, context }) => {
+  // Exactly 1 tab at all times — guard closes any extra tab SAP opens
+  const guard = registerTabGuard(context);
+
+  try {
+    await downloadFromSharePoint();
+    const allWOs = await readWOSheet();
+    console.log(`\n[Run] ${allWOs.length} WOIDs total`);
+
+    // Load checkpoint — resume from where a previous crash left off
+    const cp = loadCheckpoint();
+    const doneSet = new Set(cp.doneWoids);
+    // Apply slice for test runs — TEST_SLICE=10 runs first 10 WOIDs, TEST_SLICE=0 runs all
+    const slicedWOs = (TEST_SLICE > 0 && TEST_SLICE < Infinity) ? allWOs.slice(0, TEST_SLICE) : allWOs;
+    const pending = slicedWOs.filter(w => !doneSet.has(w.woid));
+    console.log(`[Run] Total: ${allWOs.length} | Slice: ${slicedWOs.length} | Already done: ${doneSet.size} | Pending: ${pending.length}`);
+
+    if (!pending.length) {
+      console.log('[Run] All WOIDs already completed — writing sheets and uploading...');
+    } else {
+      // Login once
+      let ap = await doLogin(page, context);
+
+      for (let idx = 0; idx < pending.length; idx++) {
+        const wo = pending[idx];
+        console.log(`\n[Run] [${doneSet.size + idx + 1}/${allWOs.length}] ${wo.woid}`);
+
+        // Check browser is still alive — if not, close everything and re-open exactly 1 tab
+        let alive = false;
+        try { ap.url(); alive = true; } catch { /* crashed */ }
+        if (!alive) {
+          console.log('[Run] Browser tab died — closing all tabs and re-logging in...');
+          // Close all existing tabs first
+          for (const p of context.pages()) {
+            try { await p.close().catch(() => {}); } catch { /* */ }
+          }
+          // Open exactly 1 new tab and login
+          try {
+            const freshPage = await context.newPage();
+            ap = await doLogin(freshPage, context);
+          } catch (e) {
+            console.log(`[Run] Re-login failed: ${e} — marking ${wo.woid} No Data and continuing`);
+            cp.detailRows.push([wo.woid, wo.name, '', 'No Data', '', '', '', '', '', '', '', '', '']);
+            cp.summaryRows.push([wo.simplify3xId, wo.domainId, wo.woid, wo.name, '0', 'No Data', '0', '', '']);
+            cp.doneWoids.push(wo.woid);
+            saveCheckpoint(cp);
+            continue;
+          }
+        }
+
+        try {
+          const { result, page: newAp } = await fetchWO(ap, wo);
+          ap = newAp;
+          cp.detailRows.push(...result.detailRows);
+          cp.summaryRows.push(result.summaryRow);
+          cp.fieldsRows.push(...result.fieldsRows);
+          cp.doneWoids.push(wo.woid);
+          // Save after every WO — crash recovery point
+          saveCheckpoint(cp);
+          console.log(`  ✓ saved checkpoint (${cp.doneWoids.length}/${allWOs.length})`);
+        } catch (err) {
+          console.log(`[Run] ERROR ${wo.woid}: ${err}`);
+          cp.detailRows.push([wo.woid, wo.name, '', 'Error', '', '', '', '', '', '', '', '', '']);
+          cp.summaryRows.push([wo.simplify3xId, wo.domainId, wo.woid, wo.name, '0', 'Error', '0', '', '']);
+          cp.doneWoids.push(wo.woid);
+          saveCheckpoint(cp);
+          // Try to recover browser
+          try { ap.url(); } catch {
+            try {
+              for (const p of context.pages()) { try { await p.close().catch(() => {}); } catch { /* */ } }
+              ap = await doLogin(await context.newPage(), context);
+            } catch { /* will re-check alive on next iteration */ }
+          }
+        }
       }
     }
 
-    console.log(`  Written ${rows.length} rows for ${woid}`);
+    // All WOIDs done — write Excel sheets and upload
+    console.log('\n[Run] Writing Excel sheets...');
+    await writeDetailSheet(cp.detailRows);
+    await writeFieldsSheet(cp.fieldsRows);
+    await writeSummarySheet(cp.summaryRows);
+    await uploadToSharePoint();
+
+    // Clear checkpoint only after successful upload
+    clearCheckpoint();
+
+    const noData  = cp.summaryRows.filter(r => r[9] === 'No Data' || r[9] === 'Error').length;
+    const drilled = cp.summaryRows.filter(r => r[11] !== '' || r[12] !== '').length;
+
+    console.log('\n═══════════════════════════════════════════');
+    console.log('           EXECUTION COMPLETE              ');
+    console.log('═══════════════════════════════════════════');
+    console.log(`Total WOIDs          : ${allWOs.length}`);
+    console.log(`Summary rows         : ${cp.summaryRows.length}`);
+    console.log(`Detail rows          : ${cp.detailRows.length}`);
+    console.log(`Drilled (ST≠40)      : ${drilled}`);
+    console.log(`No Data / Error      : ${noData}`);
+    console.log(`Sheets written       : "${SHEET_NAME}", "${SUMMARY_SHEET}", "${FIELDS_SHEET}"`);
+    console.log(`SharePoint updated   : ✓`);
+    console.log('═══════════════════════════════════════════');
+
+  } finally {
+    context.off('page', guard);
   }
-
-  // ── Write all results to Excel ────────────────────────────────────────────────
-  // Build raw rows for the fields sheet: Status, ID, Start, End, Approved, ST, OT, DT, Others, NB, Amount
-  // (skip WOs that had no data)
-  const fieldsRows: string[][] = [];
-  for (const outputRow of allOutputRows) {
-    // outputRow = [WOID, Name, TimesheetID, Status, Start, End, Approved, ST, OT, DT, Others, NB, Amount]
-    if (outputRow[3] === 'No Data') continue; // skip no-data placeholder rows
-    const [, , tsId, status, start, end, approved, st, ot, dt, others, nb, amount] = outputRow;
-    fieldsRows.push([status, tsId, start, end, approved, st, ot, dt, others, nb, amount]);
-  }
-
-  await writeOutputSheet(allOutputRows);
-  await writeFieldsSheet(fieldsRows);
-
-  console.log('\n=== COMPLETE ===');
-  console.log(`Total WOs processed : ${woList.length}`);
-  console.log(`Total rows written  : ${allOutputRows.length}`);
-  console.log(`Output file         : ${XLSX_PATH}`);
-  console.log(`Output sheet        : ${SHEET_NAME}`);
-
-  expect(allOutputRows.length).toBeGreaterThan(0);
 });
- 
